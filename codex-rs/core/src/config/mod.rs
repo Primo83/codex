@@ -21,6 +21,7 @@ use crate::config::types::UriBasedFileOpener;
 use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigRequirements;
+use crate::config_loader::ConstrainedWithSource;
 use crate::config_loader::LoaderOverrides;
 use crate::config_loader::McpServerIdentity;
 use crate::config_loader::McpServerRequirement;
@@ -32,9 +33,10 @@ use crate::features::FeatureOverrides;
 use crate::features::Features;
 use crate::features::FeaturesToml;
 use crate::git_info::resolve_root_git_project_for_trust;
+use crate::model_provider_info::LEGACY_OLLAMA_CHAT_PROVIDER_ID;
 use crate::model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use crate::model_provider_info::ModelProviderInfo;
-use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_ID;
+use crate::model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use crate::model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use crate::model_provider_info::built_in_model_providers;
 use crate::project_doc::DEFAULT_PROJECT_DOC_FILENAME;
@@ -114,6 +116,9 @@ pub struct Config {
     /// Provenance for how this [`Config`] was derived (merged layers + enforced
     /// requirements).
     pub config_layer_stack: ConfigLayerStack,
+
+    /// Warnings collected during config load that should be shown on startup.
+    pub startup_warnings: Vec<String>,
 
     /// Optional override of model selection.
     pub model: Option<String>,
@@ -212,7 +217,7 @@ pub struct Config {
     /// Show startup tooltips in the TUI welcome screen.
     pub show_tooltips: bool,
 
-    /// Start the TUI in the specified collaboration mode (plan/execute/etc.).
+    /// Start the TUI in the specified collaboration mode (plan/default).
     pub experimental_mode: Option<ModeKind>,
 
     /// Controls whether the TUI uses the terminal's alternate screen buffer.
@@ -222,6 +227,9 @@ pub struct Config {
     /// - `always`: Always use alternate screen (original behavior).
     /// - `never`: Never use alternate screen (inline mode, preserves scrollback).
     pub tui_alternate_screen: AltScreenMode,
+
+    /// Ordered list of status line item identifiers for the TUI.
+    pub tui_status_line: Option<Vec<String>>,
 
     /// The directory that should be treated as the current working directory
     /// for the session. All relative paths inside the business-logic layer are
@@ -269,6 +277,9 @@ pub struct Config {
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: PathBuf,
+
+    /// Directory where Codex writes log files (defaults to `$CODEX_HOME/log`).
+    pub log_dir: PathBuf,
 
     /// Settings that govern if and what will be written to `~/.codex/history.jsonl`.
     pub history: History,
@@ -594,6 +605,41 @@ fn constrain_mcp_servers(
     })
 }
 
+fn apply_requirement_constrained_value<T>(
+    field_name: &'static str,
+    configured_value: T,
+    constrained_value: &mut ConstrainedWithSource<T>,
+    startup_warnings: &mut Vec<String>,
+) -> std::io::Result<()>
+where
+    T: Clone + std::fmt::Debug + Send + Sync,
+{
+    if let Err(err) = constrained_value.set(configured_value) {
+        let fallback_value = constrained_value.get().clone();
+        tracing::warn!(
+            error = %err,
+            ?fallback_value,
+            requirement_source = ?constrained_value.source,
+            "configured value is disallowed by requirements; falling back to required value for {field_name}"
+        );
+        let message = format!(
+            "Configured value for `{field_name}` is disallowed by requirements; falling back to required value {fallback_value:?}. Details: {err}"
+        );
+        startup_warnings.push(message);
+
+        constrained_value.set(fallback_value).map_err(|fallback_err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "configured value for `{field_name}` is disallowed by requirements ({err}); fallback to a requirement-compliant value also failed ({fallback_err})"
+                ),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 fn mcp_server_matches_requirement(
     requirement: &McpServerRequirement,
     server: &McpServerConfig,
@@ -757,14 +803,20 @@ pub fn set_project_trust_level(
 pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
     // Validate that the provider is one of the known OSS providers
     match provider {
-        LMSTUDIO_OSS_PROVIDER_ID | OLLAMA_OSS_PROVIDER_ID | OLLAMA_CHAT_PROVIDER_ID => {
+        LMSTUDIO_OSS_PROVIDER_ID | OLLAMA_OSS_PROVIDER_ID => {
             // Valid provider, continue
+        }
+        LEGACY_OLLAMA_CHAT_PROVIDER_ID => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                OLLAMA_CHAT_PROVIDER_REMOVED_ERROR,
+            ));
         }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}, {OLLAMA_CHAT_PROVIDER_ID}"
+                    "Invalid OSS provider '{provider}'. Must be one of: {LMSTUDIO_OSS_PROVIDER_ID}, {OLLAMA_OSS_PROVIDER_ID}"
                 ),
             ));
         }
@@ -889,6 +941,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub history: Option<History>,
 
+    /// Directory where Codex writes log files, for example `codex-tui.log`.
+    /// Defaults to `$CODEX_HOME/log`.
+    pub log_dir: Option<AbsolutePathBuf>,
+
     /// Optional URI-based file opener. If set, citations to files in the model
     /// output will be hyperlinked using the specified URI scheme.
     pub file_opener: Option<UriBasedFileOpener>,
@@ -985,7 +1041,7 @@ pub struct ConfigToml {
     pub experimental_compact_prompt_file: Option<AbsolutePathBuf>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_freeform_apply_patch: Option<bool>,
-    /// Preferred OSS provider for local models, e.g. "lmstudio", "ollama", or "ollama-chat".
+    /// Preferred OSS provider for local models, e.g. "lmstudio" or "ollama".
     pub oss_provider: Option<String>,
 }
 
@@ -1087,7 +1143,11 @@ impl ConfigToml {
         profile_sandbox_mode: Option<SandboxMode>,
         windows_sandbox_level: WindowsSandboxLevel,
         resolved_cwd: &Path,
+        sandbox_policy_constraint: Option<&Constrained<SandboxPolicy>>,
     ) -> SandboxPolicyResolution {
+        let sandbox_mode_was_explicit = sandbox_mode_override.is_some()
+            || profile_sandbox_mode.is_some()
+            || self.sandbox_mode.is_some();
         let resolved_sandbox_mode = sandbox_mode_override
             .or(profile_sandbox_mode)
             .or(self.sandbox_mode)
@@ -1121,13 +1181,30 @@ impl ConfigToml {
             SandboxMode::DangerFullAccess => SandboxPolicy::DangerFullAccess,
         };
         let mut forced_auto_mode_downgraded_on_windows = false;
-        if cfg!(target_os = "windows")
-            && matches!(resolved_sandbox_mode, SandboxMode::WorkspaceWrite)
-            // If the experimental Windows sandbox is enabled, do not force a downgrade.
-            && windows_sandbox_level == codex_protocol::config_types::WindowsSandboxLevel::Disabled
+        let mut downgrade_workspace_write_if_unsupported = |policy: &mut SandboxPolicy| {
+            if cfg!(target_os = "windows")
+                // If the experimental Windows sandbox is enabled, do not force a downgrade.
+                && windows_sandbox_level
+                    == codex_protocol::config_types::WindowsSandboxLevel::Disabled
+                && matches!(&*policy, SandboxPolicy::WorkspaceWrite { .. })
+            {
+                *policy = SandboxPolicy::new_read_only_policy();
+                forced_auto_mode_downgraded_on_windows = true;
+            }
+        };
+        if matches!(resolved_sandbox_mode, SandboxMode::WorkspaceWrite) {
+            downgrade_workspace_write_if_unsupported(&mut sandbox_policy);
+        }
+        if !sandbox_mode_was_explicit
+            && let Some(constraint) = sandbox_policy_constraint
+            && let Err(err) = constraint.can_set(&sandbox_policy)
         {
-            sandbox_policy = SandboxPolicy::new_read_only_policy();
-            forced_auto_mode_downgraded_on_windows = true;
+            tracing::warn!(
+                error = %err,
+                "default sandbox policy is disallowed by requirements; falling back to required default"
+            );
+            sandbox_policy = constraint.get().clone();
+            downgrade_workspace_write_if_unsupported(&mut sandbox_policy);
         }
         SandboxPolicyResolution {
             policy: sandbox_policy,
@@ -1250,14 +1327,10 @@ fn resolve_web_search_mode(
 
 pub(crate) fn resolve_web_search_mode_for_turn(
     explicit_mode: Option<WebSearchMode>,
-    is_azure_responses_endpoint: bool,
     sandbox_policy: &SandboxPolicy,
 ) -> WebSearchMode {
     if let Some(mode) = explicit_mode {
         return mode;
-    }
-    if is_azure_responses_endpoint {
-        return WebSearchMode::Disabled;
     }
     if matches!(sandbox_policy, SandboxPolicy::DangerFullAccess) {
         WebSearchMode::Live
@@ -1286,6 +1359,7 @@ impl Config {
     ) -> std::io::Result<Self> {
         let requirements = config_layer_stack.requirements().clone();
         let user_instructions = Self::load_instructions(Some(&codex_home));
+        let mut startup_warnings = Vec::new();
 
         // Destructure ConfigOverrides fully to ensure all overrides are applied.
         let ConfigOverrides {
@@ -1357,6 +1431,9 @@ impl Config {
         let active_project = cfg
             .get_active_project(&resolved_cwd)
             .unwrap_or(ProjectConfig { trust_level: None });
+        let sandbox_mode_was_explicit = sandbox_mode.is_some()
+            || config_profile.sandbox_mode.is_some()
+            || cfg.sandbox_mode.is_some();
 
         let windows_sandbox_level = WindowsSandboxLevel::from_features(&features);
         let SandboxPolicyResolution {
@@ -1367,6 +1444,7 @@ impl Config {
             config_profile.sandbox_mode,
             windows_sandbox_level,
             &resolved_cwd,
+            Some(&requirements.sandbox_policy),
         );
         if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = &mut sandbox_policy {
             for path in additional_writable_roots {
@@ -1375,7 +1453,10 @@ impl Config {
                 }
             }
         }
-        let approval_policy = approval_policy_override
+        let approval_policy_was_explicit = approval_policy_override.is_some()
+            || config_profile.approval_policy.is_some()
+            || cfg.approval_policy.is_some();
+        let mut approval_policy = approval_policy_override
             .or(config_profile.approval_policy)
             .or(cfg.approval_policy)
             .unwrap_or_else(|| {
@@ -1387,16 +1468,20 @@ impl Config {
                     AskForApproval::default()
                 }
             });
+        if !approval_policy_was_explicit
+            && let Err(err) = requirements.approval_policy.can_set(&approval_policy)
+        {
+            tracing::warn!(
+                error = %err,
+                "default approval policy is disallowed by requirements; falling back to required default"
+            );
+            approval_policy = requirements.approval_policy.value();
+        }
         let web_search_mode = resolve_web_search_mode(&cfg, &config_profile, &features);
         // TODO(dylan): We should be able to leverage ConfigLayerStack so that
         // we can reliably check this at every config level.
-        let did_user_set_custom_approval_policy_or_sandbox_mode = approval_policy_override
-            .is_some()
-            || config_profile.approval_policy.is_some()
-            || cfg.approval_policy.is_some()
-            || sandbox_mode.is_some()
-            || config_profile.sandbox_mode.is_some()
-            || cfg.sandbox_mode.is_some();
+        let did_user_set_custom_approval_policy_or_sandbox_mode =
+            approval_policy_was_explicit || sandbox_mode_was_explicit;
 
         let mut model_providers = built_in_model_providers();
         // Merge user-defined providers into the built-in list.
@@ -1411,10 +1496,12 @@ impl Config {
         let model_provider = model_providers
             .get(&model_provider_id)
             .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("Model provider `{model_provider_id}` not found"),
-                )
+                let message = if model_provider_id == LEGACY_OLLAMA_CHAT_PROVIDER_ID {
+                    OLLAMA_CHAT_PROVIDER_REMOVED_ERROR.to_string()
+                } else {
+                    format!("Model provider `{model_provider_id}` not found")
+                };
+                std::io::Error::new(std::io::ErrorKind::NotFound, message)
             })?
             .clone();
 
@@ -1502,7 +1589,7 @@ impl Config {
             .or_else(|| {
                 features
                     .enabled(Feature::Personality)
-                    .then_some(Personality::Friendly)
+                    .then_some(Personality::Pragmatic)
             });
 
         let experimental_compact_prompt_path = config_profile
@@ -1519,6 +1606,16 @@ impl Config {
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
 
+        let log_dir = cfg
+            .log_dir
+            .as_ref()
+            .map(AbsolutePathBuf::to_path_buf)
+            .unwrap_or_else(|| {
+                let mut p = codex_home.clone();
+                p.push("log");
+                p
+            });
+
         // Ensure that every field of ConfigRequirements is applied to the final
         // Config.
         let ConfigRequirements {
@@ -1529,12 +1626,18 @@ impl Config {
             enforce_residency,
         } = requirements;
 
-        constrained_approval_policy
-            .set(approval_policy)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
-        constrained_sandbox_policy
-            .set(sandbox_policy)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+        apply_requirement_constrained_value(
+            "approval_policy",
+            approval_policy,
+            &mut constrained_approval_policy,
+            &mut startup_warnings,
+        )?;
+        apply_requirement_constrained_value(
+            "sandbox_mode",
+            sandbox_policy,
+            &mut constrained_sandbox_policy,
+            &mut startup_warnings,
+        )?;
 
         let mcp_servers = constrain_mcp_servers(cfg.mcp_servers.clone(), mcp_servers.as_ref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
@@ -1547,9 +1650,10 @@ impl Config {
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,
-            approval_policy: constrained_approval_policy,
-            sandbox_policy: constrained_sandbox_policy,
-            enforce_residency,
+            startup_warnings,
+            approval_policy: constrained_approval_policy.value,
+            sandbox_policy: constrained_sandbox_policy.value,
+            enforce_residency: enforce_residency.value,
             did_user_set_custom_approval_policy_or_sandbox_mode,
             forced_auto_mode_downgraded_on_windows,
             shell_environment_policy,
@@ -1585,6 +1689,7 @@ impl Config {
             tool_output_token_limit: cfg.tool_output_token_limit,
             agent_max_threads,
             codex_home,
+            log_dir,
             config_layer_stack,
             history,
             ephemeral: ephemeral.unwrap_or_default(),
@@ -1653,6 +1758,7 @@ impl Config {
                 .as_ref()
                 .map(|t| t.alternate_screen)
                 .unwrap_or_default(),
+            tui_status_line: cfg.tui.as_ref().and_then(|t| t.status_line.clone()),
             otel: {
                 let t: OtelConfigToml = cfg.otel.unwrap_or_default();
                 let log_user_prompt = t.log_user_prompt.unwrap_or(false);
@@ -1775,9 +1881,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
 /// Returns the path to the folder where Codex logs are stored. Does not verify
 /// that the directory exists.
 pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
-    let mut p = cfg.codex_home.clone();
-    p.push("log");
-    Ok(p)
+    Ok(cfg.log_dir.clone())
 }
 
 #[cfg(test)]
@@ -1890,6 +1994,7 @@ persistence = "none"
                 show_tooltips: true,
                 experimental_mode: None,
                 alternate_screen: AltScreenMode::Auto,
+                status_line: None,
             }
         );
     }
@@ -1910,6 +2015,7 @@ network_access = false  # This should be ignored.
             None,
             WindowsSandboxLevel::Disabled,
             &PathBuf::from("/tmp/test"),
+            None,
         );
         assert_eq!(
             resolution,
@@ -1934,6 +2040,7 @@ network_access = true  # This should be ignored.
             None,
             WindowsSandboxLevel::Disabled,
             &PathBuf::from("/tmp/test"),
+            None,
         );
         assert_eq!(
             resolution,
@@ -1966,6 +2073,7 @@ exclude_slash_tmp = true
             None,
             WindowsSandboxLevel::Disabled,
             &PathBuf::from("/tmp/test"),
+            None,
         );
         if cfg!(target_os = "windows") {
             assert_eq!(
@@ -2015,6 +2123,7 @@ trust_level = "trusted"
             None,
             WindowsSandboxLevel::Disabled,
             &PathBuf::from("/tmp/test"),
+            None,
         );
         if cfg!(target_os = "windows") {
             assert_eq!(
@@ -2347,14 +2456,14 @@ trust_level = "trusted"
 
     #[test]
     fn web_search_mode_for_turn_defaults_to_cached_when_unset() {
-        let mode = resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::ReadOnly);
+        let mode = resolve_web_search_mode_for_turn(None, &SandboxPolicy::ReadOnly);
 
         assert_eq!(mode, WebSearchMode::Cached);
     }
 
     #[test]
     fn web_search_mode_for_turn_defaults_to_live_for_danger_full_access() {
-        let mode = resolve_web_search_mode_for_turn(None, false, &SandboxPolicy::DangerFullAccess);
+        let mode = resolve_web_search_mode_for_turn(None, &SandboxPolicy::DangerFullAccess);
 
         assert_eq!(mode, WebSearchMode::Live);
     }
@@ -2363,18 +2472,10 @@ trust_level = "trusted"
     fn web_search_mode_for_turn_prefers_explicit_value() {
         let mode = resolve_web_search_mode_for_turn(
             Some(WebSearchMode::Cached),
-            false,
             &SandboxPolicy::DangerFullAccess,
         );
 
         assert_eq!(mode, WebSearchMode::Cached);
-    }
-
-    #[test]
-    fn web_search_mode_for_turn_disables_for_azure_responses_endpoint() {
-        let mode = resolve_web_search_mode_for_turn(None, true, &SandboxPolicy::DangerFullAccess);
-
-        assert_eq!(mode, WebSearchMode::Disabled);
     }
 
     #[test]
@@ -3576,7 +3677,7 @@ model = "gpt-5.1-codex"
         cfg: ConfigToml,
         model_provider_map: HashMap<String, ModelProviderInfo>,
         openai_provider: ModelProviderInfo,
-        openai_chat_completions_provider: ModelProviderInfo,
+        openai_custom_provider: ModelProviderInfo,
     }
 
     impl PrecedenceTestFixture {
@@ -3658,11 +3759,11 @@ profile = "gpt3"
 [analytics]
 enabled = true
 
-[model_providers.openai-chat-completions]
-name = "OpenAI using Chat Completions"
+[model_providers.openai-custom]
+name = "OpenAI custom"
 base_url = "https://api.openai.com/v1"
 env_key = "OPENAI_API_KEY"
-wire_api = "chat"
+wire_api = "responses"
 request_max_retries = 4            # retry failed HTTP requests
 stream_max_retries = 10            # retry dropped SSE streams
 stream_idle_timeout_ms = 300000    # 5m idle timeout
@@ -3676,7 +3777,7 @@ model_reasoning_summary = "detailed"
 
 [profiles.gpt3]
 model = "gpt-3.5-turbo"
-model_provider = "openai-chat-completions"
+model_provider = "openai-custom"
 
 [profiles.zdr]
 model = "o3"
@@ -3707,11 +3808,11 @@ model_verbosity = "high"
 
         let codex_home_temp_dir = TempDir::new().unwrap();
 
-        let openai_chat_completions_provider = ModelProviderInfo {
-            name: "OpenAI using Chat Completions".to_string(),
+        let openai_custom_provider = ModelProviderInfo {
+            name: "OpenAI custom".to_string(),
             base_url: Some("https://api.openai.com/v1".to_string()),
             env_key: Some("OPENAI_API_KEY".to_string()),
-            wire_api: crate::WireApi::Chat,
+            wire_api: crate::WireApi::Responses,
             env_key_instructions: None,
             experimental_bearer_token: None,
             query_params: None,
@@ -3725,10 +3826,7 @@ model_verbosity = "high"
         };
         let model_provider_map = {
             let mut model_provider_map = built_in_model_providers();
-            model_provider_map.insert(
-                "openai-chat-completions".to_string(),
-                openai_chat_completions_provider.clone(),
-            );
+            model_provider_map.insert("openai-custom".to_string(), openai_custom_provider.clone());
             model_provider_map
         };
 
@@ -3743,7 +3841,7 @@ model_verbosity = "high"
             cfg,
             model_provider_map,
             openai_provider,
-            openai_chat_completions_provider,
+            openai_custom_provider,
         })
     }
 
@@ -3800,7 +3898,9 @@ model_verbosity = "high"
                 tool_output_token_limit: None,
                 agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
                 codex_home: fixture.codex_home(),
+                log_dir: fixture.codex_home().join("log"),
                 config_layer_stack: Default::default(),
+                startup_warnings: Vec::new(),
                 history: History::default(),
                 ephemeral: false,
                 file_opener: UriBasedFileOpener::VsCode,
@@ -3811,7 +3911,7 @@ model_verbosity = "high"
                 model_reasoning_summary: ReasoningSummary::Detailed,
                 model_supports_reasoning_summaries: None,
                 model_verbosity: None,
-                personality: Some(Personality::Friendly),
+                personality: Some(Personality::Pragmatic),
                 chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
                 base_instructions: None,
                 developer_instructions: None,
@@ -3820,7 +3920,7 @@ model_verbosity = "high"
                 forced_login_method: None,
                 include_apply_patch_tool: false,
                 web_search_mode: None,
-                use_experimental_unified_exec_tool: false,
+                use_experimental_unified_exec_tool: !cfg!(windows),
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
                 suppress_unstable_features_warning: false,
@@ -3838,6 +3938,7 @@ model_verbosity = "high"
                 analytics_enabled: Some(true),
                 feedback_enabled: true,
                 tui_alternate_screen: AltScreenMode::Auto,
+                tui_status_line: None,
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -3864,8 +3965,8 @@ model_verbosity = "high"
             review_model: None,
             model_context_window: None,
             model_auto_compact_token_limit: None,
-            model_provider_id: "openai-chat-completions".to_string(),
-            model_provider: fixture.openai_chat_completions_provider.clone(),
+            model_provider_id: "openai-custom".to_string(),
+            model_provider: fixture.openai_custom_provider.clone(),
             approval_policy: Constrained::allow_any(AskForApproval::UnlessTrusted),
             sandbox_policy: Constrained::allow_any(SandboxPolicy::new_read_only_policy()),
             enforce_residency: Constrained::allow_any(None),
@@ -3885,7 +3986,9 @@ model_verbosity = "high"
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             codex_home: fixture.codex_home(),
+            log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
+            startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
             file_opener: UriBasedFileOpener::VsCode,
@@ -3896,7 +3999,7 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
             model_verbosity: None,
-            personality: Some(Personality::Friendly),
+            personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             developer_instructions: None,
@@ -3905,7 +4008,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
-            use_experimental_unified_exec_tool: false,
+            use_experimental_unified_exec_tool: !cfg!(windows),
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
@@ -3923,6 +4026,7 @@ model_verbosity = "high"
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            tui_status_line: None,
             otel: OtelConfig::default(),
         };
 
@@ -3985,7 +4089,9 @@ model_verbosity = "high"
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             codex_home: fixture.codex_home(),
+            log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
+            startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
             file_opener: UriBasedFileOpener::VsCode,
@@ -3996,7 +4102,7 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::default(),
             model_supports_reasoning_summaries: None,
             model_verbosity: None,
-            personality: Some(Personality::Friendly),
+            personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             developer_instructions: None,
@@ -4005,7 +4111,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
-            use_experimental_unified_exec_tool: false,
+            use_experimental_unified_exec_tool: !cfg!(windows),
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
@@ -4023,6 +4129,7 @@ model_verbosity = "high"
             analytics_enabled: Some(false),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            tui_status_line: None,
             otel: OtelConfig::default(),
         };
 
@@ -4071,7 +4178,9 @@ model_verbosity = "high"
             tool_output_token_limit: None,
             agent_max_threads: DEFAULT_AGENT_MAX_THREADS,
             codex_home: fixture.codex_home(),
+            log_dir: fixture.codex_home().join("log"),
             config_layer_stack: Default::default(),
+            startup_warnings: Vec::new(),
             history: History::default(),
             ephemeral: false,
             file_opener: UriBasedFileOpener::VsCode,
@@ -4082,7 +4191,7 @@ model_verbosity = "high"
             model_reasoning_summary: ReasoningSummary::Detailed,
             model_supports_reasoning_summaries: None,
             model_verbosity: Some(Verbosity::High),
-            personality: Some(Personality::Friendly),
+            personality: Some(Personality::Pragmatic),
             chatgpt_base_url: "https://chatgpt.com/backend-api/".to_string(),
             base_instructions: None,
             developer_instructions: None,
@@ -4091,7 +4200,7 @@ model_verbosity = "high"
             forced_login_method: None,
             include_apply_patch_tool: false,
             web_search_mode: None,
-            use_experimental_unified_exec_tool: false,
+            use_experimental_unified_exec_tool: !cfg!(windows),
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
             suppress_unstable_features_warning: false,
@@ -4109,6 +4218,7 @@ model_verbosity = "high"
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            tui_status_line: None,
             otel: OtelConfig::default(),
         };
 
@@ -4267,6 +4377,50 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn test_set_default_oss_provider_rejects_legacy_ollama_chat_provider() -> std::io::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let codex_home = temp_dir.path();
+
+        let result = set_default_oss_provider(codex_home, LEGACY_OLLAMA_CHAT_PROVIDER_ID);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains(OLLAMA_CHAT_PROVIDER_REMOVED_ERROR)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_config_rejects_legacy_ollama_chat_provider_with_helpful_error()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            model_provider: Some(LEGACY_OLLAMA_CHAT_PROVIDER_ID.to_string()),
+            ..Default::default()
+        };
+
+        let result = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        );
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains(OLLAMA_CHAT_PROVIDER_REMOVED_ERROR)
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_untrusted_project_gets_workspace_write_sandbox() -> anyhow::Result<()> {
         let config_with_untrusted = r#"
 [projects."/tmp/test"]
@@ -4281,6 +4435,7 @@ trust_level = "untrusted"
             None,
             WindowsSandboxLevel::Disabled,
             &PathBuf::from("/tmp/test"),
+            None,
         );
 
         // Verify that untrusted projects get WorkspaceWrite (or ReadOnly on Windows due to downgrade)
@@ -4298,6 +4453,103 @@ trust_level = "untrusted"
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn derive_sandbox_policy_falls_back_to_constraint_value_for_implicit_defaults()
+    -> anyhow::Result<()> {
+        let project_dir = TempDir::new()?;
+        let project_path = project_dir.path().to_path_buf();
+        let project_key = project_path.to_string_lossy().to_string();
+        let cfg = ConfigToml {
+            projects: Some(HashMap::from([(
+                project_key,
+                ProjectConfig {
+                    trust_level: Some(TrustLevel::Trusted),
+                },
+            )])),
+            ..Default::default()
+        };
+        let constrained = Constrained::new(SandboxPolicy::DangerFullAccess, |candidate| {
+            if matches!(candidate, SandboxPolicy::DangerFullAccess) {
+                Ok(())
+            } else {
+                Err(ConstraintError::InvalidValue {
+                    field_name: "sandbox_mode",
+                    candidate: format!("{candidate:?}"),
+                    allowed: "[DangerFullAccess]".to_string(),
+                    requirement_source: RequirementSource::Unknown,
+                })
+            }
+        })?;
+
+        let resolution = cfg.derive_sandbox_policy(
+            None,
+            None,
+            WindowsSandboxLevel::Disabled,
+            &project_path,
+            Some(&constrained),
+        );
+
+        assert_eq!(resolution.policy, SandboxPolicy::DangerFullAccess);
+        Ok(())
+    }
+
+    #[test]
+    fn derive_sandbox_policy_preserves_windows_downgrade_for_unsupported_fallback()
+    -> anyhow::Result<()> {
+        let project_dir = TempDir::new()?;
+        let project_path = project_dir.path().to_path_buf();
+        let project_key = project_path.to_string_lossy().to_string();
+        let cfg = ConfigToml {
+            projects: Some(HashMap::from([(
+                project_key,
+                ProjectConfig {
+                    trust_level: Some(TrustLevel::Trusted),
+                },
+            )])),
+            ..Default::default()
+        };
+        let constrained =
+            Constrained::new(SandboxPolicy::new_workspace_write_policy(), |candidate| {
+                if matches!(candidate, SandboxPolicy::WorkspaceWrite { .. }) {
+                    Ok(())
+                } else {
+                    Err(ConstraintError::InvalidValue {
+                        field_name: "sandbox_mode",
+                        candidate: format!("{candidate:?}"),
+                        allowed: "[WorkspaceWrite]".to_string(),
+                        requirement_source: RequirementSource::Unknown,
+                    })
+                }
+            })?;
+
+        let resolution = cfg.derive_sandbox_policy(
+            None,
+            None,
+            WindowsSandboxLevel::Disabled,
+            &project_path,
+            Some(&constrained),
+        );
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                resolution,
+                SandboxPolicyResolution {
+                    policy: SandboxPolicy::ReadOnly,
+                    forced_auto_mode_downgraded_on_windows: true,
+                }
+            );
+        } else {
+            assert_eq!(
+                resolution,
+                SandboxPolicyResolution {
+                    policy: SandboxPolicy::new_workspace_write_policy(),
+                    forced_auto_mode_downgraded_on_windows: false,
+                }
+            );
+        }
         Ok(())
     }
 
@@ -4454,6 +4706,117 @@ mcp_oauth_callback_port = 5678
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requirements_disallowing_default_sandbox_falls_back_to_required_default()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .cloud_requirements(CloudRequirementsLoader::new(async {
+                Some(crate::config_loader::ConfigRequirementsToml {
+                    allowed_sandbox_modes: Some(vec![
+                        crate::config_loader::SandboxModeRequirement::ReadOnly,
+                    ]),
+                    ..Default::default()
+                })
+            }))
+            .build()
+            .await?;
+
+        assert_eq!(*config.sandbox_policy.get(), SandboxPolicy::ReadOnly);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_sandbox_mode_falls_back_when_disallowed_by_requirements()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            r#"sandbox_mode = "danger-full-access"
+"#,
+        )?;
+
+        let requirements = crate::config_loader::ConfigRequirementsToml {
+            allowed_approval_policies: None,
+            allowed_sandbox_modes: Some(vec![
+                crate::config_loader::SandboxModeRequirement::ReadOnly,
+            ]),
+            mcp_servers: None,
+            rules: None,
+            enforce_residency: None,
+        };
+
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .cloud_requirements(CloudRequirementsLoader::new(
+                async move { Some(requirements) },
+            ))
+            .build()
+            .await?;
+        assert_eq!(*config.sandbox_policy.get(), SandboxPolicy::ReadOnly);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requirements_disallowing_default_approval_falls_back_to_required_default()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let workspace = TempDir::new()?;
+        let workspace_key = workspace.path().to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            format!(
+                r#"
+[projects."{workspace_key}"]
+trust_level = "untrusted"
+"#
+            ),
+        )?;
+
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(workspace.path().to_path_buf()))
+            .cloud_requirements(CloudRequirementsLoader::new(async {
+                Some(crate::config_loader::ConfigRequirementsToml {
+                    allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+                    ..Default::default()
+                })
+            }))
+            .build()
+            .await?;
+
+        assert_eq!(config.approval_policy.value(), AskForApproval::OnRequest);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_approval_policy_falls_back_when_disallowed_by_requirements()
+    -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        std::fs::write(
+            codex_home.path().join(CONFIG_TOML_FILE),
+            r#"approval_policy = "untrusted"
+"#,
+        )?;
+
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .fallback_cwd(Some(codex_home.path().to_path_buf()))
+            .cloud_requirements(CloudRequirementsLoader::new(async {
+                Some(crate::config_loader::ConfigRequirementsToml {
+                    allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
+                    ..Default::default()
+                })
+            }))
+            .build()
+            .await?;
+        assert_eq!(config.approval_policy.value(), AskForApproval::OnRequest);
         Ok(())
     }
 }
