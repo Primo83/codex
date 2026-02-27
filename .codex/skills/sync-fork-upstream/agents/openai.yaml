@@ -1,0 +1,3 @@
+interface:
+  display_name: "Sync Fork Upstream"
+  short_description: "Sync a fork with upstream/main and verify parity"
