@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::process::Stdio;
 
+use codex_core::env::is_wsl;
 use color_eyre::eyre::Report;
 use color_eyre::eyre::Result;
 use tempfile::Builder;
@@ -31,9 +32,23 @@ fn resolve_windows_program(program: &str) -> std::path::PathBuf {
 /// Resolve the editor command from environment variables.
 /// Prefers `VISUAL` over `EDITOR`.
 pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, EditorError> {
-    let raw = env::var("VISUAL")
-        .or_else(|_| env::var("EDITOR"))
-        .map_err(|_| EditorError::MissingEditor)?;
+    resolve_editor_command_for_environment(is_wsl())
+}
+
+fn resolve_editor_command_for_environment(
+    is_wsl_environment: bool,
+) -> std::result::Result<Vec<String>, EditorError> {
+    let raw = env::var("VISUAL").or_else(|_| env::var("EDITOR")).ok();
+    if let Some(raw) = raw {
+        return parse_editor_command(&raw);
+    }
+    if is_wsl_environment && let Some(command) = resolve_wsl_fallback_editor_command() {
+        return Ok(command);
+    }
+    Err(EditorError::MissingEditor)
+}
+
+fn parse_editor_command(raw: &str) -> std::result::Result<Vec<String>, EditorError> {
     let parts = {
         #[cfg(windows)]
         {
@@ -48,6 +63,25 @@ pub(crate) fn resolve_editor_command() -> std::result::Result<Vec<String>, Edito
         return Err(EditorError::EmptyCommand);
     }
     Ok(parts)
+}
+
+fn resolve_wsl_fallback_editor_command() -> Option<Vec<String>> {
+    const WSL_EDITOR_CANDIDATES: [(&str, &[&str]); 4] = [
+        ("code", &["--wait"]),
+        ("nano", &[]),
+        ("vim", &[]),
+        ("vi", &[]),
+    ];
+
+    for (program, args) in WSL_EDITOR_CANDIDATES {
+        if which::which(program).is_ok() {
+            let mut command = vec![program.to_string()];
+            command.extend(args.iter().map(ToString::to_string));
+            return Some(command);
+        }
+    }
+
+    None
 }
 
 /// Write `seed` to a temp file, launch the editor command, and return the updated content.
@@ -101,6 +135,8 @@ mod tests {
     struct EnvGuard {
         visual: Option<String>,
         editor: Option<String>,
+        path: Option<String>,
+        wsl_distro_name: Option<String>,
     }
 
     impl EnvGuard {
@@ -108,6 +144,8 @@ mod tests {
             Self {
                 visual: env::var("VISUAL").ok(),
                 editor: env::var("EDITOR").ok(),
+                path: env::var("PATH").ok(),
+                wsl_distro_name: env::var("WSL_DISTRO_NAME").ok(),
             }
         }
     }
@@ -116,6 +154,8 @@ mod tests {
         fn drop(&mut self) {
             restore_env("VISUAL", self.visual.take());
             restore_env("EDITOR", self.editor.take());
+            restore_env("PATH", self.path.take());
+            restore_env("WSL_DISTRO_NAME", self.wsl_distro_name.take());
         }
     }
 
@@ -134,7 +174,7 @@ mod tests {
             env::set_var("VISUAL", "vis");
             env::set_var("EDITOR", "ed");
         }
-        let cmd = resolve_editor_command().unwrap();
+        let cmd = resolve_editor_command_for_environment(false).unwrap();
         assert_eq!(cmd, vec!["vis".to_string()]);
     }
 
@@ -147,9 +187,59 @@ mod tests {
             env::remove_var("EDITOR");
         }
         assert!(matches!(
-            resolve_editor_command(),
+            resolve_editor_command_for_environment(false),
             Err(EditorError::MissingEditor)
         ));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn resolve_editor_uses_wsl_code_fallback_when_unset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvGuard::new();
+        let dir = tempdir().unwrap();
+        let code_path = dir.path().join("code");
+        fs::write(&code_path, "#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&code_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&code_path, perms).unwrap();
+
+        unsafe {
+            env::remove_var("VISUAL");
+            env::remove_var("EDITOR");
+            env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+            env::set_var("PATH", dir.path());
+        }
+
+        let cmd = resolve_editor_command_for_environment(true).unwrap();
+        assert_eq!(cmd, vec!["code".to_string(), "--wait".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn resolve_editor_uses_terminal_editor_fallback_when_code_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = EnvGuard::new();
+        let dir = tempdir().unwrap();
+        let nano_path = dir.path().join("nano");
+        fs::write(&nano_path, "#!/bin/sh\n").unwrap();
+        let mut perms = fs::metadata(&nano_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&nano_path, perms).unwrap();
+
+        unsafe {
+            env::remove_var("VISUAL");
+            env::remove_var("EDITOR");
+            env::set_var("WSL_DISTRO_NAME", "Ubuntu");
+            env::set_var("PATH", dir.path());
+        }
+
+        let cmd = resolve_editor_command_for_environment(true).unwrap();
+        assert_eq!(cmd, vec!["nano".to_string()]);
     }
 
     #[tokio::test]

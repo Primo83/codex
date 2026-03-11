@@ -102,6 +102,7 @@ unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 url = { workspace = true }
 webbrowser = { workspace = true }
+which = { workspace = true }
 uuid = { workspace = true }
 
 codex-windows-sandbox = { workspace = true }
@@ -115,7 +116,6 @@ hound = { version = "3.5", optional = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-which = { workspace = true }
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Console",
