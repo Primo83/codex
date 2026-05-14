@@ -10,6 +10,7 @@ node_modules
 # build
 dist/
 bazel-*
+user.bazelrc
 build/
 out/
 storybook-static/
@@ -67,8 +68,6 @@ coverage/
 
 # personal files
 personal/
-CONTINUITY.md
-review-rubric-pl.skill
 
 # os
 .DS_Store
@@ -92,3 +91,4 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
+

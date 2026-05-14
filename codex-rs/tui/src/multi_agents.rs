@@ -121,8 +121,10 @@ fn previous_agent_word_motion_fallback(
     key_event: KeyEvent,
     allow_word_motion_fallback: bool,
 ) -> bool {
-    // macOS terminals often send Option+b/f as word-motion keys instead of Option+arrow events
-    // unless enhanced keyboard reporting is enabled.
+    // Some terminals, especially on macOS, send Option+b/f as word-motion keys instead of
+    // Option+arrow events unless enhanced keyboard reporting is enabled. Callers should only
+    // enable this fallback when the composer is empty so draft editing retains the expected
+    // word-wise motion behavior.
     allow_word_motion_fallback
         && matches!(
             key_event,
@@ -145,8 +147,10 @@ fn previous_agent_word_motion_fallback(
 
 #[cfg(target_os = "macos")]
 fn next_agent_word_motion_fallback(key_event: KeyEvent, allow_word_motion_fallback: bool) -> bool {
-    // macOS terminals often send Option+b/f as word-motion keys instead of Option+arrow events
-    // unless enhanced keyboard reporting is enabled.
+    // Some terminals, especially on macOS, send Option+b/f as word-motion keys instead of
+    // Option+arrow events unless enhanced keyboard reporting is enabled. Callers should only
+    // enable this fallback when the composer is empty so draft editing retains the expected
+    // word-wise motion behavior.
     allow_word_motion_fallback
         && matches!(
             key_event,
@@ -179,6 +183,7 @@ pub(crate) fn spawn_end(
         new_agent_role,
         prompt,
         status: _,
+        ..
     } = ev;
 
     let title = match new_thread_id {
@@ -219,7 +224,7 @@ pub(crate) fn interaction_end(ev: CollabAgentInteractionEndEvent) -> PlainHistor
             nickname: receiver_agent_nickname.as_deref(),
             role: receiver_agent_role.as_deref(),
         },
-        None,
+        /*spawn_request*/ None,
     );
 
     let mut details = Vec::new();
@@ -239,7 +244,11 @@ pub(crate) fn waiting_begin(ev: CollabWaitingBeginEvent) -> PlainHistoryCell {
     let receiver_agents = merge_wait_receivers(&receiver_thread_ids, receiver_agents);
 
     let title = match receiver_agents.as_slice() {
-        [receiver] => title_with_agent("Waiting for", agent_label_from_ref(receiver), None),
+        [receiver] => title_with_agent(
+            "Waiting for",
+            agent_label_from_ref(receiver),
+            /*spawn_request*/ None,
+        ),
         [] => title_text("Waiting for agents"),
         _ => title_text(format!("Waiting for {} agents", receiver_agents.len())),
     };
@@ -285,7 +294,7 @@ pub(crate) fn close_end(ev: CollabCloseEndEvent) -> PlainHistoryCell {
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
             },
-            None,
+            /*spawn_request*/ None,
         ),
         Vec::new(),
     )
@@ -308,7 +317,7 @@ pub(crate) fn resume_begin(ev: CollabResumeBeginEvent) -> PlainHistoryCell {
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
             },
-            None,
+            /*spawn_request*/ None,
         ),
         Vec::new(),
     )
@@ -332,7 +341,7 @@ pub(crate) fn resume_end(ev: CollabResumeEndEvent) -> PlainHistoryCell {
                 nickname: receiver_agent_nickname.as_deref(),
                 role: receiver_agent_role.as_deref(),
             },
-            None,
+            /*spawn_request*/ None,
         ),
         vec![status_summary_line(&status)],
     )
@@ -536,6 +545,9 @@ fn status_summary_spans(status: &AgentStatus) -> Vec<Span<'static>> {
     match status {
         AgentStatus::PendingInit => vec![Span::from("Pending init").cyan()],
         AgentStatus::Running => vec![Span::from("Running").cyan().bold()],
+        // Allow `.yellow()`
+        #[allow(clippy::disallowed_methods)]
+        AgentStatus::Interrupted => vec![Span::from("Interrupted").yellow()],
         AgentStatus::Completed(message) => {
             let mut spans = vec![Span::from("Completed").green()];
             if let Some(message) = message.as_ref() {
@@ -597,6 +609,8 @@ mod tests {
                 new_agent_nickname: Some("Robie".to_string()),
                 new_agent_role: Some("explorer".to_string()),
                 prompt: "Compute 11! and reply with just the integer result.".to_string(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
                 status: AgentStatus::PendingInit,
             },
             Some(&SpawnRequestSummary {
@@ -671,22 +685,51 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn agent_shortcut_matches_option_arrow_word_motion_fallbacks() {
+    fn agent_shortcut_matches_option_arrow_word_motion_fallbacks_only_when_allowed() {
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            /*allow_word_motion_fallback*/ false,
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            /*allow_word_motion_fallback*/ false,
+        ));
         assert!(previous_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
-            true,
+            /*allow_word_motion_fallback*/ true,
         ));
         assert!(next_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
-            true,
+            /*allow_word_motion_fallback*/ true,
         ));
         assert!(!previous_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
-            false,
+            /*allow_word_motion_fallback*/ false,
         ));
         assert!(!next_agent_shortcut_matches(
             KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
-            false,
+            /*allow_word_motion_fallback*/ false,
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn agent_shortcut_matches_option_arrows_only() {
+        assert!(previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(!previous_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('b'), crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
+        ));
+        assert!(!next_agent_shortcut_matches(
+            KeyEvent::new(KeyCode::Char('f'), crossterm::event::KeyModifiers::ALT,),
+            /*allow_word_motion_fallback*/ false
         ));
     }
 
@@ -704,6 +747,8 @@ mod tests {
                 new_agent_nickname: Some("Robie".to_string()),
                 new_agent_role: Some("explorer".to_string()),
                 prompt: String::new(),
+                model: "gpt-5".to_string(),
+                reasoning_effort: ReasoningEffortConfig::High,
                 status: AgentStatus::PendingInit,
             },
             Some(&SpawnRequestSummary {
@@ -712,7 +757,7 @@ mod tests {
             }),
         );
 
-        let lines = cell.display_lines(200);
+        let lines = cell.display_lines(/*width*/ 200);
         let title = &lines[0];
         assert_eq!(title.spans[2].content.as_ref(), "Robie");
         assert_eq!(title.spans[2].style.fg, Some(Color::Cyan));
@@ -724,8 +769,27 @@ mod tests {
         assert_eq!(title.spans[6].style.fg, Some(Color::Magenta));
     }
 
+    #[test]
+    fn collab_resume_interrupted_snapshot() {
+        let sender_thread_id = ThreadId::from_string("00000000-0000-0000-0000-000000000001")
+            .expect("valid sender thread id");
+        let robie_id = ThreadId::from_string("00000000-0000-0000-0000-000000000002")
+            .expect("valid robie thread id");
+
+        let cell = resume_end(CollabResumeEndEvent {
+            call_id: "call-resume".to_string(),
+            sender_thread_id,
+            receiver_thread_id: robie_id,
+            receiver_agent_nickname: Some("Robie".to_string()),
+            receiver_agent_role: Some("explorer".to_string()),
+            status: AgentStatus::Interrupted,
+        });
+
+        assert_snapshot!("collab_resume_interrupted", cell_to_text(&cell));
+    }
+
     fn cell_to_text(cell: &PlainHistoryCell) -> String {
-        cell.display_lines(200)
+        cell.display_lines(/*width*/ 200)
             .iter()
             .map(line_to_text)
             .collect::<Vec<_>>()

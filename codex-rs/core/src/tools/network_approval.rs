@@ -1,6 +1,8 @@
 use crate::codex::Session;
-use crate::guardian::GUARDIAN_REJECTION_MESSAGE;
 use crate::guardian::GuardianApprovalRequest;
+use crate::guardian::guardian_rejection_message;
+use crate::guardian::guardian_timeout_message;
+use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
 use crate::guardian::routes_approval_to_guardian;
 use crate::network_policy_decision::denied_network_policy_message;
@@ -19,6 +21,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::WarningEvent;
 use indexmap::IndexMap;
 use std::collections::HashMap;
@@ -118,6 +121,13 @@ fn allows_network_approval_flow(policy: AskForApproval) -> bool {
     !matches!(policy, AskForApproval::Never)
 }
 
+fn sandbox_policy_allows_network_approval_flow(policy: &SandboxPolicy) -> bool {
+    matches!(
+        policy,
+        SandboxPolicy::ReadOnly { .. } | SandboxPolicy::WorkspaceWrite { .. }
+    )
+}
+
 impl PendingApprovalDecision {
     fn to_network_decision(self) -> NetworkDecision {
         match self {
@@ -161,6 +171,7 @@ impl PendingHostApproval {
 
 struct ActiveNetworkApprovalCall {
     registration_id: String,
+    turn_id: String,
 }
 
 pub(crate) struct NetworkApprovalService {
@@ -184,16 +195,25 @@ impl Default for NetworkApprovalService {
 }
 
 impl NetworkApprovalService {
-    pub(crate) async fn copy_session_approved_hosts_to(&self, other: &Self) {
-        let approved_hosts = self.session_approved_hosts.lock().await;
+    /// Replace the target session's approval cache with the source session's
+    /// currently approved hosts.
+    pub(crate) async fn sync_session_approved_hosts_to(&self, other: &Self) {
+        let approved_hosts = self.session_approved_hosts.lock().await.clone();
         let mut other_approved_hosts = other.session_approved_hosts.lock().await;
+        other_approved_hosts.clear();
         other_approved_hosts.extend(approved_hosts.iter().cloned());
     }
 
-    async fn register_call(&self, registration_id: String) {
+    async fn register_call(&self, registration_id: String, turn_id: String) {
         let mut active_calls = self.active_calls.lock().await;
         let key = registration_id.clone();
-        active_calls.insert(key, Arc::new(ActiveNetworkApprovalCall { registration_id }));
+        active_calls.insert(
+            key,
+            Arc::new(ActiveNetworkApprovalCall {
+                registration_id,
+                turn_id,
+            }),
+        );
     }
 
     pub(crate) async fn unregister_call(&self, registration_id: &str) {
@@ -324,6 +344,16 @@ impl NetworkApprovalService {
             .await;
             return NetworkDecision::deny(REASON_NOT_ALLOWED);
         };
+        if !sandbox_policy_allows_network_approval_flow(turn_context.sandbox_policy.get()) {
+            pending.set_decision(PendingApprovalDecision::Deny).await;
+            let mut pending_approvals = self.pending_host_approvals.lock().await;
+            pending_approvals.remove(&key);
+            self.record_outcome_for_single_active_call(NetworkApprovalOutcome::DeniedByPolicy(
+                policy_denial_message,
+            ))
+            .await;
+            return NetworkDecision::deny(REASON_NOT_ALLOWED);
+        }
         if !allows_network_approval_flow(turn_context.approval_policy.value()) {
             pending.set_decision(PendingApprovalDecision::Deny).await;
             let mut pending_approvals = self.pending_host_approvals.lock().await;
@@ -339,11 +369,20 @@ impl NetworkApprovalService {
             host: request.host.clone(),
             protocol,
         };
-        let approval_decision = if routes_approval_to_guardian(&turn_context) {
+        let owner_call = self.resolve_single_active_call().await;
+        let guardian_approval_id = Self::approval_id_for_key(&key);
+        let use_guardian = routes_approval_to_guardian(&turn_context);
+        let guardian_review_id = use_guardian.then(new_guardian_review_id);
+        let approval_decision = if let Some(review_id) = guardian_review_id.clone() {
             review_approval_request(
                 &session,
                 &turn_context,
+                review_id,
                 GuardianApprovalRequest::NetworkAccess {
+                    id: guardian_approval_id.clone(),
+                    turn_id: owner_call
+                        .as_ref()
+                        .map_or_else(|| turn_context.sub_id.clone(), |call| call.turn_id.clone()),
                     target,
                     host: request.host,
                     protocol,
@@ -360,14 +399,13 @@ impl NetworkApprovalService {
                 .request_command_approval(
                     turn_context.as_ref(),
                     approval_id,
-                    None,
+                    /*approval_id*/ None,
                     prompt_command,
-                    turn_context.cwd.clone(),
+                    turn_context.cwd.to_path_buf(),
                     Some(prompt_reason),
                     Some(network_approval_context.clone()),
-                    None,
-                    None,
-                    None,
+                    /*proposed_execpolicy_amendment*/ None,
+                    /*additional_permissions*/ None,
                     available_decisions,
                 )
                 .await
@@ -440,25 +478,41 @@ impl NetworkApprovalService {
                                 .await;
                         }
                     }
-                    self.record_outcome_for_single_active_call(
-                        NetworkApprovalOutcome::DeniedByUser,
-                    )
-                    .await;
+                    if let Some(owner_call) = owner_call.as_ref() {
+                        self.record_call_outcome(
+                            &owner_call.registration_id,
+                            NetworkApprovalOutcome::DeniedByUser,
+                        )
+                        .await;
+                    }
                     cache_session_deny = true;
                     PendingApprovalDecision::Deny
                 }
             },
             ReviewDecision::Denied | ReviewDecision::Abort => {
-                if routes_approval_to_guardian(&turn_context) {
-                    self.record_outcome_for_single_active_call(
-                        NetworkApprovalOutcome::DeniedByPolicy(
-                            GUARDIAN_REJECTION_MESSAGE.to_string(),
-                        ),
+                if let Some(review_id) = guardian_review_id.as_deref() {
+                    if let Some(owner_call) = owner_call.as_ref() {
+                        let message = guardian_rejection_message(session.as_ref(), review_id).await;
+                        self.record_call_outcome(
+                            &owner_call.registration_id,
+                            NetworkApprovalOutcome::DeniedByPolicy(message),
+                        )
+                        .await;
+                    }
+                } else if let Some(owner_call) = owner_call.as_ref() {
+                    self.record_call_outcome(
+                        &owner_call.registration_id,
+                        NetworkApprovalOutcome::DeniedByUser,
                     )
                     .await;
-                } else {
-                    self.record_outcome_for_single_active_call(
-                        NetworkApprovalOutcome::DeniedByUser,
+                }
+                PendingApprovalDecision::Deny
+            }
+            ReviewDecision::TimedOut => {
+                if let Some(owner_call) = owner_call.as_ref() {
+                    self.record_call_outcome(
+                        &owner_call.registration_id,
+                        NetworkApprovalOutcome::DeniedByPolicy(guardian_timeout_message()),
                     )
                     .await;
                 }
@@ -523,8 +577,7 @@ pub(crate) fn build_network_policy_decider(
 
 pub(crate) async fn begin_network_approval(
     session: &Session,
-    _turn_id: &str,
-    _call_id: &str,
+    turn_id: &str,
     has_managed_network_requirements: bool,
     spec: Option<NetworkApprovalSpec>,
 ) -> Option<ActiveNetworkApproval> {
@@ -537,7 +590,7 @@ pub(crate) async fn begin_network_approval(
     session
         .services
         .network_approval
-        .register_call(registration_id.clone())
+        .register_call(registration_id.clone(), turn_id.to_string())
         .await;
 
     Some(ActiveNetworkApproval {
@@ -590,206 +643,5 @@ pub(crate) async fn finish_deferred_network_approval(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_network_proxy::BlockedRequestArgs;
-    use codex_protocol::protocol::AskForApproval;
-    use pretty_assertions::assert_eq;
-
-    #[tokio::test]
-    async fn pending_approvals_are_deduped_per_host_protocol_and_port() {
-        let service = NetworkApprovalService::default();
-        let key = HostApprovalKey {
-            host: "example.com".to_string(),
-            protocol: "http",
-            port: 443,
-        };
-
-        let (first, first_is_owner) = service.get_or_create_pending_approval(key.clone()).await;
-        let (second, second_is_owner) = service.get_or_create_pending_approval(key).await;
-
-        assert!(first_is_owner);
-        assert!(!second_is_owner);
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[tokio::test]
-    async fn pending_approvals_do_not_dedupe_across_ports() {
-        let service = NetworkApprovalService::default();
-        let first_key = HostApprovalKey {
-            host: "example.com".to_string(),
-            protocol: "https",
-            port: 443,
-        };
-        let second_key = HostApprovalKey {
-            host: "example.com".to_string(),
-            protocol: "https",
-            port: 8443,
-        };
-
-        let (first, first_is_owner) = service.get_or_create_pending_approval(first_key).await;
-        let (second, second_is_owner) = service.get_or_create_pending_approval(second_key).await;
-
-        assert!(first_is_owner);
-        assert!(second_is_owner);
-        assert!(!Arc::ptr_eq(&first, &second));
-    }
-
-    #[tokio::test]
-    async fn session_approved_hosts_preserve_protocol_and_port_scope() {
-        let source = NetworkApprovalService::default();
-        {
-            let mut approved_hosts = source.session_approved_hosts.lock().await;
-            approved_hosts.extend([
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "https",
-                    port: 443,
-                },
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "https",
-                    port: 8443,
-                },
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "http",
-                    port: 80,
-                },
-            ]);
-        }
-
-        let seeded = NetworkApprovalService::default();
-        source.copy_session_approved_hosts_to(&seeded).await;
-
-        let mut copied = seeded
-            .session_approved_hosts
-            .lock()
-            .await
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        copied.sort_by(|a, b| (&a.host, a.protocol, a.port).cmp(&(&b.host, b.protocol, b.port)));
-
-        assert_eq!(
-            copied,
-            vec![
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "http",
-                    port: 80,
-                },
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "https",
-                    port: 443,
-                },
-                HostApprovalKey {
-                    host: "example.com".to_string(),
-                    protocol: "https",
-                    port: 8443,
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_waiters_receive_owner_decision() {
-        let pending = Arc::new(PendingHostApproval::new());
-
-        let waiter = {
-            let pending = Arc::clone(&pending);
-            tokio::spawn(async move { pending.wait_for_decision().await })
-        };
-
-        pending
-            .set_decision(PendingApprovalDecision::AllowOnce)
-            .await;
-
-        let decision = waiter.await.expect("waiter should complete");
-        assert_eq!(decision, PendingApprovalDecision::AllowOnce);
-    }
-
-    #[test]
-    fn allow_once_and_allow_for_session_both_allow_network() {
-        assert_eq!(
-            PendingApprovalDecision::AllowOnce.to_network_decision(),
-            NetworkDecision::Allow
-        );
-        assert_eq!(
-            PendingApprovalDecision::AllowForSession.to_network_decision(),
-            NetworkDecision::Allow
-        );
-    }
-
-    #[test]
-    fn only_never_policy_disables_network_approval_flow() {
-        assert!(!allows_network_approval_flow(AskForApproval::Never));
-        assert!(allows_network_approval_flow(AskForApproval::OnRequest));
-        assert!(allows_network_approval_flow(AskForApproval::OnFailure));
-        assert!(allows_network_approval_flow(AskForApproval::UnlessTrusted));
-    }
-
-    fn denied_blocked_request(host: &str) -> BlockedRequest {
-        BlockedRequest::new(BlockedRequestArgs {
-            host: host.to_string(),
-            reason: "not_allowed".to_string(),
-            client: None,
-            method: None,
-            mode: None,
-            protocol: "http".to_string(),
-            decision: Some("deny".to_string()),
-            source: Some("decider".to_string()),
-            port: Some(80),
-        })
-    }
-
-    #[tokio::test]
-    async fn record_blocked_request_sets_policy_outcome_for_owner_call() {
-        let service = NetworkApprovalService::default();
-        service.register_call("registration-1".to_string()).await;
-
-        service
-            .record_blocked_request(denied_blocked_request("example.com"))
-            .await;
-
-        assert_eq!(
-            service.take_call_outcome("registration-1").await,
-            Some(NetworkApprovalOutcome::DeniedByPolicy(
-                "Network access to \"example.com\" was blocked: domain is not on the allowlist for the current sandbox mode.".to_string()
-            ))
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_request_policy_does_not_override_user_denial_outcome() {
-        let service = NetworkApprovalService::default();
-        service.register_call("registration-1".to_string()).await;
-
-        service
-            .record_call_outcome("registration-1", NetworkApprovalOutcome::DeniedByUser)
-            .await;
-        service
-            .record_blocked_request(denied_blocked_request("example.com"))
-            .await;
-
-        assert_eq!(
-            service.take_call_outcome("registration-1").await,
-            Some(NetworkApprovalOutcome::DeniedByUser)
-        );
-    }
-
-    #[tokio::test]
-    async fn record_blocked_request_ignores_ambiguous_unattributed_blocked_requests() {
-        let service = NetworkApprovalService::default();
-        service.register_call("registration-1".to_string()).await;
-        service.register_call("registration-2".to_string()).await;
-
-        service
-            .record_blocked_request(denied_blocked_request("example.com"))
-            .await;
-
-        assert_eq!(service.take_call_outcome("registration-1").await, None);
-        assert_eq!(service.take_call_outcome("registration-2").await, None);
-    }
-}
+#[path = "network_approval_tests.rs"]
+mod tests;

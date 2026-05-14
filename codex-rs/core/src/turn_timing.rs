@@ -1,8 +1,10 @@
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use codex_otel::metrics::names::TURN_TTFM_DURATION_METRIC;
-use codex_otel::metrics::names::TURN_TTFT_DURATION_METRIC;
+use codex_otel::TURN_TTFM_DURATION_METRIC;
+use codex_otel::TURN_TTFT_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use tokio::sync::Mutex;
@@ -45,6 +47,7 @@ pub(crate) struct TurnTimingState {
 #[derive(Debug, Default)]
 struct TurnTimingStateInner {
     started_at: Option<Instant>,
+    started_at_unix_secs: Option<i64>,
     first_token_at: Option<Instant>,
     first_message_at: Option<Instant>,
 }
@@ -53,8 +56,22 @@ impl TurnTimingState {
     pub(crate) async fn mark_turn_started(&self, started_at: Instant) {
         let mut state = self.state.lock().await;
         state.started_at = Some(started_at);
+        state.started_at_unix_secs = Some(now_unix_timestamp_secs());
         state.first_token_at = None;
         state.first_message_at = None;
+    }
+
+    pub(crate) async fn started_at_unix_secs(&self) -> Option<i64> {
+        self.state.lock().await.started_at_unix_secs
+    }
+
+    pub(crate) async fn completed_at_and_duration_ms(&self) -> (Option<i64>, Option<i64>) {
+        let state = self.state.lock().await;
+        let completed_at = Some(now_unix_timestamp_secs());
+        let duration_ms = state
+            .started_at
+            .map(|started_at| i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
+        (completed_at, duration_ms)
     }
 
     pub(crate) async fn record_ttft_for_response_event(
@@ -75,6 +92,13 @@ impl TurnTimingState {
         let mut state = self.state.lock().await;
         state.record_turn_ttfm()
     }
+}
+
+fn now_unix_timestamp_secs() -> i64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
 impl TurnTimingStateInner {
@@ -141,142 +165,18 @@ fn response_item_records_turn_ttft(item: &ResponseItem) -> bool {
         ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::GhostSnapshot { .. }
         | ResponseItem::Compaction { .. } => true,
         ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
         | ResponseItem::Other => false,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use codex_protocol::items::AgentMessageItem;
-    use codex_protocol::items::TurnItem;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::FunctionCallOutputPayload;
-    use codex_protocol::models::ResponseItem;
-    use pretty_assertions::assert_eq;
-    use std::time::Instant;
-
-    use super::TurnTimingState;
-    use super::response_item_records_turn_ttft;
-    use crate::ResponseEvent;
-
-    #[tokio::test]
-    async fn turn_timing_state_records_ttft_only_once_per_turn() {
-        let state = TurnTimingState::default();
-        assert_eq!(
-            state
-                .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
-                .await,
-            None
-        );
-
-        state.mark_turn_started(Instant::now()).await;
-        assert_eq!(
-            state
-                .record_ttft_for_response_event(&ResponseEvent::Created)
-                .await,
-            None
-        );
-        assert!(
-            state
-                .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
-                .await
-                .is_some()
-        );
-        assert_eq!(
-            state
-                .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta(
-                    "again".to_string()
-                ))
-                .await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn turn_timing_state_records_ttfm_independently_of_ttft() {
-        let state = TurnTimingState::default();
-        state.mark_turn_started(Instant::now()).await;
-
-        assert!(
-            state
-                .record_ttft_for_response_event(&ResponseEvent::OutputTextDelta("hi".to_string()))
-                .await
-                .is_some()
-        );
-        assert!(
-            state
-                .record_ttfm_for_turn_item(&TurnItem::AgentMessage(AgentMessageItem {
-                    id: "msg-1".to_string(),
-                    content: Vec::new(),
-                    phase: None,
-                }))
-                .await
-                .is_some()
-        );
-        assert_eq!(
-            state
-                .record_ttfm_for_turn_item(&TurnItem::AgentMessage(AgentMessageItem {
-                    id: "msg-2".to_string(),
-                    content: Vec::new(),
-                    phase: None,
-                }))
-                .await,
-            None
-        );
-    }
-
-    #[test]
-    fn response_item_records_turn_ttft_for_first_output_signals() {
-        assert!(response_item_records_turn_ttft(
-            &ResponseItem::FunctionCall {
-                id: None,
-                name: "shell".to_string(),
-                arguments: "{}".to_string(),
-                call_id: "call-1".to_string(),
-            }
-        ));
-        assert!(response_item_records_turn_ttft(
-            &ResponseItem::CustomToolCall {
-                id: None,
-                status: None,
-                call_id: "call-2".to_string(),
-                name: "custom".to_string(),
-                input: "echo hi".to_string(),
-            }
-        ));
-        assert!(response_item_records_turn_ttft(&ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "hello".to_string(),
-            }],
-            end_turn: None,
-            phase: None,
-        }));
-    }
-
-    #[test]
-    fn response_item_records_turn_ttft_ignores_empty_non_output_items() {
-        assert!(!response_item_records_turn_ttft(&ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: String::new(),
-            }],
-            end_turn: None,
-            phase: None,
-        }));
-        assert!(!response_item_records_turn_ttft(
-            &ResponseItem::FunctionCallOutput {
-                call_id: "call-1".to_string(),
-                output: FunctionCallOutputPayload::from_text("ok".to_string()),
-            }
-        ));
-    }
-}
+#[path = "turn_timing_tests.rs"]
+mod tests;

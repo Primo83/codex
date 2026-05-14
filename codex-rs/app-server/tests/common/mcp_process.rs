@@ -25,6 +25,15 @@ use codex_app_server_protocol::ConfigReadParams;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ExperimentalFeatureListParams;
 use codex_app_server_protocol::FeedbackUploadParams;
+use codex_app_server_protocol::FsCopyParams;
+use codex_app_server_protocol::FsCreateDirectoryParams;
+use codex_app_server_protocol::FsGetMetadataParams;
+use codex_app_server_protocol::FsReadDirectoryParams;
+use codex_app_server_protocol::FsReadFileParams;
+use codex_app_server_protocol::FsRemoveParams;
+use codex_app_server_protocol::FsUnwatchParams;
+use codex_app_server_protocol::FsWatchParams;
+use codex_app_server_protocol::FsWriteFileParams;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetConversationSummaryParams;
@@ -36,11 +45,16 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCRequest;
 use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ListMcpServerStatusParams;
 use codex_app_server_protocol::LoginAccountParams;
+use codex_app_server_protocol::MarketplaceAddParams;
+use codex_app_server_protocol::McpResourceReadParams;
+use codex_app_server_protocol::McpServerToolCallParams;
 use codex_app_server_protocol::MockExperimentalMethodParams;
 use codex_app_server_protocol::ModelListParams;
 use codex_app_server_protocol::PluginInstallParams;
 use codex_app_server_protocol::PluginListParams;
+use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginUninstallParams;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ReviewStartParams;
@@ -49,17 +63,21 @@ use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::ThreadArchiveParams;
 use codex_app_server_protocol::ThreadCompactStartParams;
 use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadLoadedListParams;
+use codex_app_server_protocol::ThreadMemoryModeSetParams;
 use codex_app_server_protocol::ThreadMetadataUpdateParams;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadRealtimeAppendAudioParams;
 use codex_app_server_protocol::ThreadRealtimeAppendTextParams;
+use codex_app_server_protocol::ThreadRealtimeListVoicesParams;
 use codex_app_server_protocol::ThreadRealtimeStartParams;
 use codex_app_server_protocol::ThreadRealtimeStopParams;
 use codex_app_server_protocol::ThreadResumeParams;
 use codex_app_server_protocol::ThreadRollbackParams;
 use codex_app_server_protocol::ThreadSetNameParams;
+use codex_app_server_protocol::ThreadShellCommandParams;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadUnarchiveParams;
 use codex_app_server_protocol::ThreadUnsubscribeParams;
@@ -68,7 +86,7 @@ use codex_app_server_protocol::TurnInterruptParams;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::WindowsSandboxSetupStartParams;
-use codex_core::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
+use codex_login::default_client::CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR;
 use tokio::process::Command;
 
 pub struct McpProcess {
@@ -84,10 +102,19 @@ pub struct McpProcess {
 }
 
 pub const DEFAULT_CLIENT_NAME: &str = "codex-app-server-tests";
+const DISABLE_MANAGED_CONFIG_ENV_VAR: &str = "CODEX_APP_SERVER_DISABLE_MANAGED_CONFIG";
 
 impl McpProcess {
     pub async fn new(codex_home: &Path) -> anyhow::Result<Self> {
-        Self::new_with_env(codex_home, &[]).await
+        Self::new_with_env_and_args(codex_home, &[], &[]).await
+    }
+
+    pub async fn new_without_managed_config(codex_home: &Path) -> anyhow::Result<Self> {
+        Self::new_with_env(codex_home, &[(DISABLE_MANAGED_CONFIG_ENV_VAR, Some("1"))]).await
+    }
+
+    pub async fn new_with_args(codex_home: &Path, args: &[&str]) -> anyhow::Result<Self> {
+        Self::new_with_env_and_args(codex_home, &[], args).await
     }
 
     /// Creates a new MCP process, allowing tests to override or remove
@@ -98,6 +125,14 @@ impl McpProcess {
     pub async fn new_with_env(
         codex_home: &Path,
         env_overrides: &[(&str, Option<&str>)],
+    ) -> anyhow::Result<Self> {
+        Self::new_with_env_and_args(codex_home, env_overrides, &[]).await
+    }
+
+    async fn new_with_env_and_args(
+        codex_home: &Path,
+        env_overrides: &[(&str, Option<&str>)],
+        args: &[&str],
     ) -> anyhow::Result<Self> {
         let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
             .context("should find binary for codex-app-server")?;
@@ -110,6 +145,7 @@ impl McpProcess {
         cmd.env("CODEX_HOME", codex_home);
         cmd.env("RUST_LOG", "info");
         cmd.env_remove(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR);
+        cmd.args(args);
 
         for (k, v) in env_overrides {
             match v {
@@ -259,7 +295,8 @@ impl McpProcess {
 
     /// Send an `account/rateLimits/read` JSON-RPC request.
     pub async fn send_get_account_rate_limits_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/rateLimits/read", None).await
+        self.send_request("account/rateLimits/read", /*params*/ None)
+            .await
     }
 
     /// Send an `account/read` JSON-RPC request.
@@ -377,6 +414,15 @@ impl McpProcess {
         self.send_request("thread/compact/start", params).await
     }
 
+    /// Send a `thread/shellCommand` JSON-RPC request.
+    pub async fn send_thread_shell_command_request(
+        &mut self,
+        params: ThreadShellCommandParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/shellCommand", params).await
+    }
+
     /// Send a `thread/rollback` JSON-RPC request.
     pub async fn send_thread_rollback_request(
         &mut self,
@@ -431,10 +477,38 @@ impl McpProcess {
         self.send_request("experimentalFeature/list", params).await
     }
 
+    /// Send an `experimentalFeature/enablement/set` JSON-RPC request.
+    pub async fn send_experimental_feature_enablement_set_request(
+        &mut self,
+        params: codex_app_server_protocol::ExperimentalFeatureEnablementSetParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("experimentalFeature/enablement/set", params)
+            .await
+    }
+
     /// Send an `app/list` JSON-RPC request.
     pub async fn send_apps_list_request(&mut self, params: AppsListParams) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("app/list", params).await
+    }
+
+    /// Send an `mcpServer/resource/read` JSON-RPC request.
+    pub async fn send_mcp_resource_read_request(
+        &mut self,
+        params: McpResourceReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("mcpServer/resource/read", params).await
+    }
+
+    /// Send an `mcpServer/tool/call` JSON-RPC request.
+    pub async fn send_mcp_server_tool_call_request(
+        &mut self,
+        params: McpServerToolCallParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("mcpServer/tool/call", params).await
     }
 
     /// Send a `skills/list` JSON-RPC request.
@@ -444,6 +518,15 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("skills/list", params).await
+    }
+
+    /// Send a `marketplace/add` JSON-RPC request.
+    pub async fn send_marketplace_add_request(
+        &mut self,
+        params: MarketplaceAddParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("marketplace/add", params).await
     }
 
     /// Send a `plugin/install` JSON-RPC request.
@@ -473,6 +556,24 @@ impl McpProcess {
         self.send_request("plugin/list", params).await
     }
 
+    /// Send a `plugin/read` JSON-RPC request.
+    pub async fn send_plugin_read_request(
+        &mut self,
+        params: PluginReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("plugin/read", params).await
+    }
+
+    /// Send an `mcpServerStatus/list` JSON-RPC request.
+    pub async fn send_list_mcp_server_status_request(
+        &mut self,
+        params: ListMcpServerStatusParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("mcpServerStatus/list", params).await
+    }
+
     /// Send a JSON-RPC request with raw params for protocol-level validation tests.
     pub async fn send_raw_request(
         &mut self,
@@ -499,6 +600,15 @@ impl McpProcess {
         self.send_request("mock/experimentalMethod", params).await
     }
 
+    /// Send a `thread/memoryMode/set` JSON-RPC request (v2, experimental).
+    pub async fn send_thread_memory_mode_set_request(
+        &mut self,
+        params: ThreadMemoryModeSetParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/memoryMode/set", params).await
+    }
+
     /// Send a `turn/start` JSON-RPC request (v2).
     pub async fn send_turn_start_request(
         &mut self,
@@ -506,6 +616,15 @@ impl McpProcess {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("turn/start", params).await
+    }
+
+    /// Send a `thread/inject_items` JSON-RPC request (v2).
+    pub async fn send_thread_inject_items_request(
+        &mut self,
+        params: ThreadInjectItemsParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/inject_items", params).await
     }
 
     /// Send a `command/exec` JSON-RPC request (v2).
@@ -591,10 +710,19 @@ impl McpProcess {
         self.send_request("thread/realtime/stop", params).await
     }
 
+    pub async fn send_thread_realtime_list_voices_request(
+        &mut self,
+        params: ThreadRealtimeListVoicesParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/realtime/listVoices", params)
+            .await
+    }
+
     /// Deterministically clean up an intentionally in-flight turn.
     ///
     /// Some tests assert behavior while a turn is still running. Returning from those tests
-    /// without an explicit interrupt + `codex/event/turn_aborted` wait can leave in-flight work
+    /// without an explicit interrupt + terminal turn notification wait can leave in-flight work
     /// racing teardown and intermittently show up as `LEAK` in nextest.
     ///
     /// In rare races, the turn can also fail or complete on its own after we send
@@ -631,18 +759,19 @@ impl McpProcess {
         }
         match tokio::time::timeout(
             read_timeout,
-            self.read_stream_until_notification_message("codex/event/turn_aborted"),
+            self.read_stream_until_notification_message("turn/completed"),
         )
         .await
         {
             Ok(result) => {
-                result.with_context(|| "failed while waiting for turn aborted notification")?;
+                result.with_context(|| "failed while waiting for terminal turn notification")?;
             }
             Err(err) => {
                 if self.pending_turn_completed_notification(&thread_id, &turn_id) {
                     return Ok(());
                 }
-                return Err(err).with_context(|| "timed out waiting for turn aborted notification");
+                return Err(err)
+                    .with_context(|| "timed out waiting for terminal turn notification");
             }
         }
         Ok(())
@@ -698,9 +827,72 @@ impl McpProcess {
         self.send_request("config/batchWrite", params).await
     }
 
+    pub async fn send_fs_read_file_request(
+        &mut self,
+        params: FsReadFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readFile", params).await
+    }
+
+    pub async fn send_fs_write_file_request(
+        &mut self,
+        params: FsWriteFileParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/writeFile", params).await
+    }
+
+    pub async fn send_fs_create_directory_request(
+        &mut self,
+        params: FsCreateDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/createDirectory", params).await
+    }
+
+    pub async fn send_fs_get_metadata_request(
+        &mut self,
+        params: FsGetMetadataParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/getMetadata", params).await
+    }
+
+    pub async fn send_fs_read_directory_request(
+        &mut self,
+        params: FsReadDirectoryParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/readDirectory", params).await
+    }
+
+    pub async fn send_fs_remove_request(&mut self, params: FsRemoveParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/remove", params).await
+    }
+
+    pub async fn send_fs_copy_request(&mut self, params: FsCopyParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/copy", params).await
+    }
+
+    pub async fn send_fs_watch_request(&mut self, params: FsWatchParams) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/watch", params).await
+    }
+
+    pub async fn send_fs_unwatch_request(
+        &mut self,
+        params: FsUnwatchParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("fs/unwatch", params).await
+    }
+
     /// Send an `account/logout` JSON-RPC request.
     pub async fn send_logout_account_request(&mut self) -> anyhow::Result<i64> {
-        self.send_request("account/logout", None).await
+        self.send_request("account/logout", /*params*/ None).await
     }
 
     /// Send an `account/login/start` JSON-RPC request for API key login.
@@ -719,6 +911,14 @@ impl McpProcess {
     pub async fn send_login_account_chatgpt_request(&mut self) -> anyhow::Result<i64> {
         let params = serde_json::json!({
             "type": "chatgpt"
+        });
+        self.send_request("account/login/start", Some(params)).await
+    }
+
+    /// Send an `account/login/start` JSON-RPC request for ChatGPT device code login.
+    pub async fn send_login_account_chatgpt_device_code_request(&mut self) -> anyhow::Result<i64> {
+        let params = serde_json::json!({
+            "type": "chatgptDeviceCode"
         });
         self.send_request("account/login/start", Some(params)).await
     }
@@ -962,6 +1162,31 @@ impl McpProcess {
         Ok(notification)
     }
 
+    pub async fn read_stream_until_matching_notification<F>(
+        &mut self,
+        description: &str,
+        predicate: F,
+    ) -> anyhow::Result<JSONRPCNotification>
+    where
+        F: Fn(&JSONRPCNotification) -> bool,
+    {
+        eprintln!("in read_stream_until_matching_notification({description})");
+
+        let message = self
+            .read_stream_until_message(|message| {
+                matches!(
+                    message,
+                    JSONRPCMessage::Notification(notification) if predicate(notification)
+                )
+            })
+            .await?;
+
+        let JSONRPCMessage::Notification(notification) = message else {
+            unreachable!("expected JSONRPCMessage::Notification, got {message:?}");
+        };
+        Ok(notification)
+    }
+
     pub async fn read_next_message(&mut self) -> anyhow::Result<JSONRPCMessage> {
         self.read_stream_until_message(|_| true).await
     }
@@ -972,6 +1197,16 @@ impl McpProcess {
     /// messages buffered from the prior turn.
     pub fn clear_message_buffer(&mut self) {
         self.pending_messages.clear();
+    }
+
+    pub fn pending_notification_methods(&self) -> Vec<String> {
+        self.pending_messages
+            .iter()
+            .filter_map(|message| match message {
+                JSONRPCMessage::Notification(notification) => Some(notification.method.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Reads the stream until a message matches `predicate`, buffering any non-matching messages

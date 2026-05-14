@@ -1,4 +1,5 @@
 use anyhow::Result;
+use app_test_support::ChatGptAuthFixture;
 use app_test_support::McpProcess;
 use app_test_support::create_apply_patch_sse_response;
 use app_test_support::create_fake_rollout_with_text_elements;
@@ -8,6 +9,7 @@ use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::create_shell_command_sse_response;
 use app_test_support::rollout_path;
 use app_test_support::to_response;
+use app_test_support::write_chatgpt_auth;
 use chrono::Utc;
 use codex_app_server_protocol::AskForApproval;
 use codex_app_server_protocol::CommandExecutionApprovalDecision;
@@ -36,6 +38,8 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
+use codex_config::types::AuthCredentialsStoreMode;
+use codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::Personality;
 use codex_protocol::models::ContentItem;
@@ -60,6 +64,16 @@ use std::process::Command;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use uuid::Uuid;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+use super::analytics::assert_basic_thread_initialized_event;
+use super::analytics::enable_analytics_capture;
+use super::analytics::thread_initialized_event;
+use super::analytics::wait_for_analytics_payload;
 
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const CODEX_5_2_INSTRUCTIONS_TEMPLATE_DEFAULT: &str = "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.";
@@ -142,6 +156,51 @@ async fn thread_resume_rejects_unmaterialized_thread() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_resume_tracks_thread_initialized_analytics() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+
+    let codex_home = TempDir::new()?;
+    create_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+        /*general_analytics_enabled*/ true,
+    )?;
+    enable_analytics_capture(&server, codex_home.path()).await?;
+
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+
+    let mut mcp = McpProcess::new_without_managed_config(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let resume_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+    let ThreadResumeResponse { thread, .. } = to_response::<ThreadResumeResponse>(resume_resp)?;
+
+    let payload = wait_for_analytics_payload(&server, DEFAULT_READ_TIMEOUT).await?;
+    let event = thread_initialized_event(&payload)?;
+    assert_basic_thread_initialized_event(event, &thread.id, "gpt-5.2-codex", "resumed");
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_resume_returns_rollout_history() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
@@ -162,7 +221,7 @@ async fn thread_resume_returns_rollout_history() -> Result<()> {
             .map(|elem| serde_json::to_value(elem).expect("serialize text element"))
             .collect(),
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
@@ -313,6 +372,7 @@ stream_max_retries = 0
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: RolloutSessionSource::Cli,
+        agent_path: None,
         agent_nickname: None,
         agent_role: None,
         model_provider: Some("mock_provider".to_string()),
@@ -358,7 +418,9 @@ stream_max_retries = 0
     )?;
     let state_db =
         StateRuntime::init(codex_home.path().to_path_buf(), "mock_provider".into()).await?;
-    state_db.mark_backfill_complete(None).await?;
+    state_db
+        .mark_backfill_complete(/*last_watermark*/ None)
+        .await?;
 
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
@@ -419,7 +481,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
         "Saved user message",
         Vec::new(),
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
     let rollout_file_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
     let persisted_rollout = std::fs::read_to_string(&rollout_file_path)?;
@@ -430,6 +492,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
             "type": "event_msg",
             "payload": serde_json::to_value(EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: turn_id.to_string(),
+                started_at: None,
                 model_context_window: None,
                 collaboration_mode_kind: Default::default(),
             }))?,
@@ -441,6 +504,7 @@ async fn thread_resume_and_read_interrupt_incomplete_rollout_turn_when_thread_is
             "payload": serde_json::to_value(EventMsg::AgentMessage(AgentMessageEvent {
                 message: "Still running".to_string(),
                 phase: None,
+                memory_citation: None,
             }))?,
         })
         .to_string(),
@@ -1011,7 +1075,7 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
                 "-c".to_string(),
                 "print(42)".to_string(),
             ],
-            None,
+            /*workdir*/ None,
             Some(5000),
             "call-1",
         )?,
@@ -1132,7 +1196,7 @@ async fn thread_resume_replays_pending_command_execution_request_approval() -> R
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-    wait_for_responses_request_count(&server, 3).await?;
+    wait_for_responses_request_count(&server, /*expected_count*/ 3).await?;
 
     Ok(())
 }
@@ -1298,7 +1362,7 @@ async fn thread_resume_replays_pending_file_change_request_approval() -> Result<
         primary.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
-    wait_for_responses_request_count(&server, 3).await?;
+    wait_for_responses_request_count(&server, /*expected_count*/ 3).await?;
 
     Ok(())
 }
@@ -1404,6 +1468,99 @@ async fn thread_resume_fails_when_required_mcp_server_fails_to_initialize() -> R
         err.error.message.contains("required_broken"),
         "unexpected error message: {}",
         err.error.message
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_resume_surfaces_cloud_requirements_load_errors() -> Result<()> {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/backend-api/wham/config/requirements"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html>nope</html>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "error": { "code": "refresh_token_invalidated" }
+        })))
+        .mount(&server)
+        .await;
+
+    let codex_home = TempDir::new()?;
+    let model_server = create_mock_responses_server_repeating_assistant("Done").await;
+    let chatgpt_base_url = format!("{}/backend-api", server.uri());
+    create_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &model_server.uri(),
+        &chatgpt_base_url,
+        /*general_analytics_enabled*/ false,
+    )?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("chatgpt-token")
+            .refresh_token("stale-refresh-token")
+            .plan_type("business")
+            .chatgpt_user_id("user-123")
+            .chatgpt_account_id("account-123")
+            .account_id("account-123"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved user message",
+        Vec::new(),
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let refresh_token_url = format!("{}/oauth/token", server.uri());
+    let mut mcp = McpProcess::new_with_env(
+        codex_home.path(),
+        &[
+            ("OPENAI_API_KEY", None),
+            (
+                REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+                Some(refresh_token_url.as_str()),
+            ),
+        ],
+    )
+    .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let resume_id = mcp
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: conversation_id,
+            ..Default::default()
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(resume_id)),
+    )
+    .await??;
+
+    assert!(
+        err.error.message.contains("failed to load configuration"),
+        "unexpected error message: {}",
+        err.error.message
+    );
+    assert_eq!(
+        err.error.data,
+        Some(json!({
+            "reason": "cloudRequirements",
+            "errorCode": "Auth",
+            "action": "relogin",
+            "statusCode": 401,
+            "detail": "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.",
+        }))
     );
 
     Ok(())
@@ -1722,6 +1879,45 @@ model_provider = "mock_provider"
 
 [features]
 personality = true
+general_analytics = true
+
+[model_providers.mock_provider]
+name = "Mock provider for test"
+base_url = "{server_uri}/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+"#
+        ),
+    )
+}
+
+fn create_config_toml_with_chatgpt_base_url(
+    codex_home: &std::path::Path,
+    server_uri: &str,
+    chatgpt_base_url: &str,
+    general_analytics_enabled: bool,
+) -> std::io::Result<()> {
+    let general_analytics_toml = if general_analytics_enabled {
+        "\ngeneral_analytics = true".to_string()
+    } else {
+        "\ngeneral_analytics = false".to_string()
+    };
+    let config_toml = codex_home.join("config.toml");
+    std::fs::write(
+        config_toml,
+        format!(
+            r#"
+model = "gpt-5.2-codex"
+approval_policy = "never"
+sandbox_mode = "read-only"
+chatgpt_base_url = "{chatgpt_base_url}"
+
+model_provider = "mock_provider"
+
+[features]
+personality = true
+{general_analytics_toml}
 
 [model_providers.mock_provider]
 name = "Mock provider for test"
@@ -1799,7 +1995,7 @@ fn setup_rollout_fixture(codex_home: &Path, server_uri: &str) -> Result<RolloutF
         preview,
         Vec::new(),
         Some("mock_provider"),
-        None,
+        /*git_info*/ None,
     )?;
     let rollout_file_path = rollout_path(codex_home, filename_ts, &conversation_id);
     set_rollout_mtime(rollout_file_path.as_path(), expected_updated_at_rfc3339)?;

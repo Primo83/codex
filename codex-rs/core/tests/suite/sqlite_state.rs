@@ -1,7 +1,7 @@
 use anyhow::Result;
-use codex_core::config::types::McpServerConfig;
-use codex_core::config::types::McpServerTransportConfig;
-use codex_core::features::Feature;
+use codex_config::types::McpServerConfig;
+use codex_config::types::McpServerTransportConfig;
+use codex_features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::protocol::AskForApproval;
@@ -83,7 +83,7 @@ async fn new_thread_is_recorded_in_state_db() -> Result<()> {
 
     let metadata = metadata.expect("thread should exist in state db");
     assert_eq!(metadata.id, thread_id);
-    assert_eq!(metadata.rollout_path, rollout_path);
+    assert_eq!(metadata.rollout_path, rollout_path.to_path_buf());
     assert!(
         rollout_path.exists(),
         "rollout should be materialized after first user message"
@@ -110,6 +110,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 "required": ["city"],
                 "properties": { "city": { "type": "string" } }
             }),
+            defer_loading: true,
         },
         DynamicToolSpec {
             name: "weather_lookup".to_string(),
@@ -119,6 +120,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                 "required": ["zip"],
                 "properties": { "zip": { "type": "string" } }
             }),
+            defer_loading: false,
         },
     ];
     let dynamic_tools_for_hook = dynamic_tools.clone();
@@ -139,6 +141,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
                     originator: "test".to_string(),
                     cli_version: "test".to_string(),
                     source: SessionSource::default(),
+                    agent_path: None,
                     agent_nickname: None,
                     agent_role: None,
                     model_provider: None,
@@ -205,7 +208,7 @@ async fn backfill_scans_existing_rollouts() -> Result<()> {
 
     let metadata = metadata.expect("backfilled thread should exist in state db");
     assert_eq!(metadata.id, thread_id);
-    assert_eq!(metadata.rollout_path, rollout_path);
+    assert_eq!(metadata.rollout_path, rollout_path.to_path_buf());
     assert_eq!(metadata.model_provider, default_provider);
     assert!(metadata.first_user_message.is_some());
 
@@ -365,6 +368,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 },
                 enabled: true,
                 required: false,
+                supports_parallel_tool_calls: false,
                 disabled_reason: None,
                 startup_timeout_sec: Some(Duration::from_secs(10)),
                 tool_timeout_sec: None,
@@ -372,6 +376,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
                 disabled_tools: None,
                 scopes: None,
                 oauth_resource: None,
+                tools: HashMap::new(),
             },
         );
         config
@@ -392,6 +397,7 @@ async fn mcp_call_marks_thread_memory_mode_polluted_when_configured() -> Result<
             final_output_json_schema: None,
             cwd: test.cwd_path().to_path_buf(),
             approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
             sandbox_policy: SandboxPolicy::new_read_only_policy(),
             model: test.session_configured.model.clone(),
             effort: None,
@@ -458,16 +464,17 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     let db = test.codex.state_db().expect("state db enabled");
     let expected_thread_id = test.session_configured.session_id.to_string();
 
-    let subscriber = tracing_subscriber::registry().with(codex_state::log_db::start(db.clone()));
-    let dispatch = tracing::Dispatch::new(subscriber);
-    let _guard = tracing::dispatcher::set_default(&dispatch);
-
     test.submit_turn("run a shell command").await?;
-    {
+
+    let log_db_layer = codex_state::log_db::start(db.clone());
+    let subscriber = tracing_subscriber::registry().with(log_db_layer.clone());
+    let dispatch = tracing::Dispatch::new(subscriber);
+    tracing::dispatcher::with_default(&dispatch, || {
         let span = tracing::info_span!("test_log_span", thread_id = %expected_thread_id);
         let _entered = span.enter();
         tracing::info!("ToolCall: shell_command {{\"command\":\"echo hello\"}}");
-    }
+    });
+    log_db_layer.flush().await;
 
     let mut found = None;
     for _ in 0..80 {
@@ -480,7 +487,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
         if let Some(row) = rows.into_iter().find(|row| {
             row.message
                 .as_deref()
-                .is_some_and(|m| m.starts_with("ToolCall:"))
+                .is_some_and(|m| m.contains("ToolCall:"))
         }) {
             let thread_id = row.thread_id;
             let message = row.message;
@@ -495,7 +502,7 @@ async fn tool_call_logs_include_thread_id() -> Result<()> {
     assert!(
         message
             .as_deref()
-            .is_some_and(|text| text.starts_with("ToolCall:")),
+            .is_some_and(|text| text.contains("ToolCall:")),
         "expected ToolCall message, got {message:?}"
     );
 

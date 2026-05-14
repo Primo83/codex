@@ -1,3 +1,4 @@
+mod analytics_server;
 mod auth_fixtures;
 mod config;
 mod mcp_process;
@@ -6,12 +7,14 @@ mod models_cache;
 mod responses;
 mod rollout;
 
+pub use analytics_server::start_analytics_events_server;
 pub use auth_fixtures::ChatGptAuthFixture;
 pub use auth_fixtures::ChatGptIdTokenClaims;
 pub use auth_fixtures::encode_id_token;
 pub use auth_fixtures::write_chatgpt_auth;
 use codex_app_server_protocol::JSONRPCResponse;
 pub use config::write_mock_responses_config_toml;
+pub use config::write_mock_responses_config_toml_with_chatgpt_base_url;
 pub use core_test_support::format_with_current_shell;
 pub use core_test_support::format_with_current_shell_display;
 pub use core_test_support::format_with_current_shell_display_non_login;
