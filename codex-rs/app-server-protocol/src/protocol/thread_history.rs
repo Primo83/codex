@@ -17,6 +17,7 @@ use crate::protocol::v2::ThreadItem;
 use crate::protocol::v2::Turn;
 use crate::protocol::v2::TurnError as V2TurnError;
 use crate::protocol::v2::TurnError;
+use crate::protocol::v2::TurnItemsView;
 use crate::protocol::v2::TurnStatus;
 use crate::protocol::v2::UserInput;
 use crate::protocol::v2::WebSearchAction;
@@ -123,6 +124,20 @@ impl ThreadHistoryBuilder {
             .or_else(|| self.turns.last().cloned())
     }
 
+    /// Returns the index of the active turn snapshot within the finished turn list.
+    ///
+    /// When a turn is still open, this is the index it will occupy after
+    /// `finish`. When no turn is open, it is the index of the last finished turn.
+    pub fn active_turn_position(&self) -> Option<usize> {
+        if self.current_turn.is_some() {
+            Some(self.turns.len())
+        } else if self.turns.is_empty() {
+            None
+        } else {
+            Some(self.turns.len() - 1)
+        }
+    }
+
     pub fn has_active_turn(&self) -> bool {
         self.current_turn.is_some()
     }
@@ -203,7 +218,6 @@ impl ThreadHistoryBuilder {
             EventMsg::Error(payload) => self.handle_error(payload),
             EventMsg::TokenCount(_) => {}
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
-            EventMsg::UndoCompleted(_) => {}
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
             EventMsg::TurnStarted(payload) => self.handle_turn_started(payload),
             EventMsg::TurnComplete(payload) => self.handle_turn_complete(payload),
@@ -343,7 +357,10 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
+            | codex_protocol::items::TurnItem::FileChange(_)
+            | codex_protocol::items::TurnItem::McpToolCall(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -364,7 +381,10 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
             | codex_protocol::items::TurnItem::WebSearch(_)
+            | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
+            | codex_protocol::items::TurnItem::FileChange(_)
+            | codex_protocol::items::TurnItem::McpToolCall(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => {}
         }
     }
@@ -454,6 +474,7 @@ impl ThreadHistoryBuilder {
     ) {
         let item = ThreadItem::DynamicToolCall {
             id: payload.call_id.clone(),
+            namespace: payload.namespace.clone(),
             tool: payload.tool.clone(),
             arguments: payload.arguments.clone(),
             status: DynamicToolCallStatus::InProgress,
@@ -477,6 +498,7 @@ impl ThreadHistoryBuilder {
         let duration_ms = i64::try_from(payload.duration.as_millis()).ok();
         let item = ThreadItem::DynamicToolCall {
             id: payload.call_id.clone(),
+            namespace: payload.namespace.clone(),
             tool: payload.tool.clone(),
             arguments: payload.arguments.clone(),
             status,
@@ -502,6 +524,7 @@ impl ThreadHistoryBuilder {
                 .arguments
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
+            mcp_app_resource_uri: payload.mcp_app_resource_uri.clone(),
             result: None,
             error: None,
             duration_ms: None,
@@ -518,11 +541,11 @@ impl ThreadHistoryBuilder {
         let duration_ms = i64::try_from(payload.duration.as_millis()).ok();
         let (result, error) = match &payload.result {
             Ok(value) => (
-                Some(McpToolCallResult {
+                Some(Box::new(McpToolCallResult {
                     content: value.content.clone(),
                     structured_content: value.structured_content.clone(),
                     meta: value.meta.clone(),
-                }),
+                })),
                 None,
             ),
             Err(message) => (
@@ -542,6 +565,7 @@ impl ThreadHistoryBuilder {
                 .arguments
                 .clone()
                 .unwrap_or(serde_json::Value::Null),
+            mcp_app_resource_uri: payload.mcp_app_resource_uri.clone(),
             result,
             error,
             duration_ms,
@@ -552,7 +576,7 @@ impl ThreadHistoryBuilder {
     fn handle_view_image_tool_call(&mut self, payload: &ViewImageToolCallEvent) {
         let item = ThreadItem::ImageView {
             id: payload.call_id.clone(),
-            path: payload.path.to_string_lossy().into_owned(),
+            path: payload.path.clone(),
         };
         self.upsert_item_in_current_turn(item);
     }
@@ -975,8 +999,15 @@ impl ThreadHistoryBuilder {
     }
 
     fn new_turn(&mut self, id: Option<String>) -> PendingTurn {
+        let id = id.unwrap_or_else(|| {
+            if self.next_rollout_index == 0 {
+                Uuid::now_v7().to_string()
+            } else {
+                format!("rollout-{}", self.current_rollout_index)
+            }
+        });
         PendingTurn {
-            id: id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+            id,
             items: Vec::new(),
             error: None,
             status: TurnStatus::Completed,
@@ -1136,6 +1167,7 @@ impl From<PendingTurn> for Turn {
         Self {
             id: value.id,
             items: value.items,
+            items_view: TurnItemsView::Full,
             error: value.error,
             status: value.status,
             started_at: value.started_at,
@@ -1150,6 +1182,7 @@ impl From<&PendingTurn> for Turn {
         Self {
             id: value.id.clone(),
             items: value.items.clone(),
+            items_view: TurnItemsView::Full,
             error: value.error.clone(),
             status: value.status.clone(),
             started_at: value.started_at,
@@ -1193,6 +1226,8 @@ mod tests {
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::protocol::WebSearchEndEvent;
+    use codex_utils_absolute_path::test_support::PathBufExt;
+    use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1324,12 +1359,14 @@ mod tests {
                     id: "user-item-id".to_string(),
                     content: Vec::new(),
                 }),
+                started_at_ms: 0,
             }),
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_id.to_string(),
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -1397,13 +1434,14 @@ mod tests {
                 status: "completed".into(),
                 revised_prompt: Some("final prompt".into()),
                 result: "Zm9v".into(),
-                saved_path: Some("/tmp/ig_123.png".into()),
+                saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
             })),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: "turn-image".into(),
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             })),
         ];
 
@@ -1418,6 +1456,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: vec![
                     ThreadItem::UserMessage {
                         id: "item-1".into(),
@@ -1431,7 +1470,7 @@ mod tests {
                         status: "completed".into(),
                         revised_prompt: Some("final prompt".into()),
                         result: "Zm9v".into(),
-                        saved_path: Some("/tmp/ig_123.png".into()),
+                        saved_path: Some(test_path_buf("/tmp/ig_123.png").abs()),
                     },
                 ],
             }
@@ -1622,8 +1661,8 @@ mod tests {
             .collect::<Vec<_>>();
         let turns = build_turns_from_rollout_items(&items);
         assert_eq!(turns.len(), 2);
-        assert!(Uuid::parse_str(&turns[0].id).is_ok());
-        assert!(Uuid::parse_str(&turns[1].id).is_ok());
+        assert_eq!(turns[0].id, "rollout-0");
+        assert_eq!(turns[1].id, "rollout-5");
         assert_ne!(turns[0].id, turns[1].id);
         assert_eq!(turns[0].status, TurnStatus::Completed);
         assert_eq!(turns[1].status, TurnStatus::Completed);
@@ -1727,6 +1766,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -1785,8 +1825,9 @@ mod tests {
                 call_id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "hello world".into()],
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hello world".into(),
                 }],
@@ -1807,6 +1848,7 @@ mod tests {
                     tool: "lookup".into(),
                     arguments: Some(serde_json::json!({"id":"123"})),
                 },
+                mcp_app_resource_uri: None,
                 duration: Duration::from_millis(8),
                 result: Err("boom".into()),
             }),
@@ -1835,7 +1877,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-1".into(),
                 command: "echo 'hello world'".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: Some("pid-1".into()),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
@@ -1855,6 +1897,7 @@ mod tests {
                 tool: "lookup".into(),
                 status: McpToolCallStatus::Failed,
                 arguments: serde_json::json!({"id":"123"}),
+                mcp_app_resource_uri: None,
                 result: None,
                 error: Some(McpToolCallError {
                     message: "boom".into(),
@@ -1880,6 +1923,7 @@ mod tests {
                     tool: "lookup".into(),
                     arguments: Some(serde_json::json!({"id":"123"})),
                 },
+                mcp_app_resource_uri: Some("ui://widget/lookup.html".into()),
                 duration: Duration::from_millis(8),
                 result: Ok(CallToolResult {
                     content: vec![serde_json::json!({
@@ -1909,7 +1953,8 @@ mod tests {
                 tool: "lookup".into(),
                 status: McpToolCallStatus::Completed,
                 arguments: serde_json::json!({"id":"123"}),
-                result: Some(McpToolCallResult {
+                mcp_app_resource_uri: Some("ui://widget/lookup.html".into()),
+                result: Some(Box::new(McpToolCallResult {
                     content: vec![serde_json::json!({
                         "type": "text",
                         "text": "result"
@@ -1918,7 +1963,7 @@ mod tests {
                     meta: Some(serde_json::json!({
                         "ui/resourceUri": "ui://widget/lookup.html"
                     })),
-                }),
+                })),
                 error: None,
                 duration_ms: Some(8),
             }
@@ -1944,6 +1989,8 @@ mod tests {
                 codex_protocol::dynamic_tools::DynamicToolCallRequest {
                     call_id: "dyn-1".into(),
                     turn_id: "turn-1".into(),
+                    started_at_ms: 0,
+                    namespace: Some("codex_app".into()),
                     tool: "lookup_ticket".into(),
                     arguments: serde_json::json!({"id":"ABC-123"}),
                 },
@@ -1951,6 +1998,8 @@ mod tests {
             EventMsg::DynamicToolCallResponse(DynamicToolCallResponseEvent {
                 call_id: "dyn-1".into(),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
+                namespace: Some("codex_app".into()),
                 tool: "lookup_ticket".into(),
                 arguments: serde_json::json!({"id":"ABC-123"}),
                 content_items: vec![CoreDynamicToolCallOutputContentItem::InputText {
@@ -1973,6 +2022,7 @@ mod tests {
             turns[0].items[1],
             ThreadItem::DynamicToolCall {
                 id: "dyn-1".into(),
+                namespace: Some("codex_app".into()),
                 tool: "lookup_ticket".into(),
                 arguments: serde_json::json!({"id":"ABC-123"}),
                 status: DynamicToolCallStatus::Completed,
@@ -2004,8 +2054,9 @@ mod tests {
                 call_id: "exec-declined".into(),
                 process_id: Some("pid-2".into()),
                 turn_id: "turn-1".into(),
+                completed_at_ms: 0,
                 command: vec!["ls".into()],
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown { cmd: "ls".into() }],
                 source: ExecCommandSource::Agent,
                 interaction_input: None,
@@ -2047,7 +2098,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-declined".into(),
                 command: "ls".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: Some("pid-2".into()),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
@@ -2092,6 +2143,8 @@ mod tests {
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 1_000,
+                completed_at_ms: None,
                 status: GuardianAssessmentStatus::InProgress,
                 risk_level: None,
                 user_authorization: None,
@@ -2101,7 +2154,7 @@ mod tests {
                     "type": "command",
                     "source": "shell",
                     "command": "rm -rf /tmp/guardian",
-                    "cwd": "/tmp",
+                    "cwd": test_path_buf("/tmp"),
                 }))
                 .expect("guardian action"),
             }),
@@ -2109,6 +2162,8 @@ mod tests {
                 id: "review-guardian-exec".into(),
                 target_item_id: Some("guardian-exec".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 1_000,
+                completed_at_ms: Some(1_042),
                 status: GuardianAssessmentStatus::Denied,
                 risk_level: Some(codex_protocol::protocol::GuardianRiskLevel::High),
                 user_authorization: Some(codex_protocol::protocol::GuardianUserAuthorization::Low),
@@ -2120,7 +2175,7 @@ mod tests {
                     "type": "command",
                     "source": "shell",
                     "command": "rm -rf /tmp/guardian",
-                    "cwd": "/tmp",
+                    "cwd": test_path_buf("/tmp"),
                 }))
                 .expect("guardian action"),
             }),
@@ -2138,7 +2193,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-exec".into(),
                 command: "rm -rf /tmp/guardian".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Declined,
@@ -2171,6 +2226,8 @@ mod tests {
                 id: "review-guardian-execve".into(),
                 target_item_id: Some("guardian-execve".into()),
                 turn_id: "turn-1".into(),
+                started_at_ms: 2_000,
+                completed_at_ms: None,
                 status: GuardianAssessmentStatus::InProgress,
                 risk_level: None,
                 user_authorization: None,
@@ -2181,7 +2238,7 @@ mod tests {
                     "source": "shell",
                     "program": "/bin/rm",
                     "argv": ["/usr/bin/rm", "-f", "/tmp/file.sqlite"],
-                    "cwd": "/tmp",
+                    "cwd": test_path_buf("/tmp"),
                 }))
                 .expect("guardian action"),
             }),
@@ -2199,7 +2256,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-execve".into(),
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::InProgress,
@@ -2233,6 +2290,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -2250,8 +2308,9 @@ mod tests {
                 call_id: "exec-late".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-a".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
                 }],
@@ -2270,6 +2329,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -2288,7 +2348,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-late".into(),
                 command: "echo done".into(),
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 process_id: Some("pid-42".into()),
                 source: CommandExecutionSource::Agent,
                 status: CommandExecutionStatus::Completed,
@@ -2322,6 +2382,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -2339,8 +2400,9 @@ mod tests {
                 call_id: "exec-unknown-turn".into(),
                 process_id: Some("pid-42".into()),
                 turn_id: "turn-missing".into(),
+                completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
-                cwd: PathBuf::from("/tmp"),
+                cwd: test_path_buf("/tmp").abs(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
                 }],
@@ -2359,6 +2421,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -2468,6 +2531,7 @@ mod tests {
             EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
                 call_id: "patch-call".into(),
                 turn_id: turn_id.to_string(),
+                started_at_ms: 0,
                 changes: [(
                     PathBuf::from("README.md"),
                     codex_protocol::protocol::FileChange::Add {
@@ -2533,6 +2597,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -2551,6 +2616,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "still in b".into(),
@@ -2562,6 +2628,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -2596,6 +2663,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -2652,6 +2720,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             })),
         ];
 
@@ -2665,6 +2734,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: Vec::new(),
             }]
         );
@@ -2681,6 +2751,7 @@ mod tests {
             }),
             EventMsg::CollabResumeEnd(codex_protocol::protocol::CollabResumeEndEvent {
                 call_id: "resume-1".into(),
+                completed_at_ms: 0,
                 sender_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000001")
                     .expect("valid sender thread id"),
                 receiver_thread_id: ThreadId::try_from("00000000-0000-0000-0000-000000000002")
@@ -2737,6 +2808,7 @@ mod tests {
             }),
             EventMsg::CollabAgentSpawnEnd(codex_protocol::protocol::CollabAgentSpawnEndEvent {
                 call_id: "spawn-1".into(),
+                completed_at_ms: 0,
                 sender_thread_id,
                 new_thread_id: Some(spawned_thread_id),
                 new_agent_nickname: Some("Scout".into()),
@@ -2798,6 +2870,7 @@ mod tests {
             EventMsg::CollabAgentInteractionBegin(
                 codex_protocol::protocol::CollabAgentInteractionBeginEvent {
                     call_id: "send-1".into(),
+                    started_at_ms: 0,
                     sender_thread_id: sender,
                     receiver_thread_id: receiver,
                     prompt: "new task".into(),
@@ -2806,6 +2879,7 @@ mod tests {
             EventMsg::CollabAgentInteractionEnd(
                 codex_protocol::protocol::CollabAgentInteractionEndEvent {
                     call_id: "send-1".into(),
+                    completed_at_ms: 0,
                     sender_thread_id: sender,
                     receiver_thread_id: receiver,
                     receiver_agent_nickname: None,
@@ -2897,6 +2971,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
             EventMsg::Error(ErrorEvent {
                 message: "request-level failure".into(),
@@ -2919,6 +2994,7 @@ mod tests {
                 started_at: None,
                 completed_at: None,
                 duration_ms: None,
+                items_view: TurnItemsView::Full,
                 items: vec![ThreadItem::UserMessage {
                     id: "item-1".into(),
                     content: vec![UserInput::Text {
@@ -2956,6 +3032,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             }),
         ];
 
@@ -3007,6 +3084,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             })),
         ];
 
@@ -3047,7 +3125,6 @@ mod tests {
                 content: vec![codex_protocol::models::ContentItem::InputText {
                     text: "plain text".into(),
                 }],
-                end_turn: None,
                 phase: None,
             }),
             RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -3055,6 +3132,7 @@ mod tests {
                 last_agent_message: None,
                 completed_at: None,
                 duration_ms: None,
+                time_to_first_token_ms: None,
             })),
         ];
 

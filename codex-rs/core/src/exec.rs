@@ -30,6 +30,7 @@ use codex_protocol::error::Result;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
@@ -99,11 +100,13 @@ pub struct ExecParams {
 /// The unelevated restricted-token backend only consumes extra deny-write
 /// carveouts on top of the legacy `WorkspaceWrite` allow set. The elevated
 /// backend can also consume explicit read and write roots during setup/refresh.
-/// Read-root overrides are layered on top of the baseline helper/platform roots
-/// that the elevated setup path needs to launch the sandboxed command.
+/// Read-root overrides are layered on top of the baseline helper roots that the
+/// elevated setup path needs to launch the sandboxed command. Split policies
+/// that opt into platform defaults carry that explicitly with the override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowsSandboxFilesystemOverrides {
     pub(crate) read_roots_override: Option<Vec<PathBuf>>,
+    pub(crate) read_roots_include_platform_defaults: bool,
     pub(crate) write_roots_override: Option<Vec<PathBuf>>,
     pub(crate) additional_deny_write_paths: Vec<AbsolutePathBuf>,
 }
@@ -149,6 +152,19 @@ pub enum ExecExpiration {
     Timeout(Duration),
     DefaultTimeout,
     Cancellation(CancellationToken),
+    TimeoutOrCancellation {
+        timeout: Duration,
+        cancellation: CancellationToken,
+    },
+}
+
+/// Why an `ExecExpiration` completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecExpirationOutcome {
+    /// The configured timeout elapsed.
+    TimedOut,
+    /// The cancellation token was cancelled.
+    Cancelled,
 }
 
 impl From<Option<u64>> for ExecExpiration {
@@ -166,14 +182,30 @@ impl From<u64> for ExecExpiration {
 }
 
 impl ExecExpiration {
-    pub(crate) async fn wait(self) {
+    /// Waits for this expiration and reports whether it timed out or was cancelled.
+    pub async fn wait_with_outcome(self) -> ExecExpirationOutcome {
         match self {
-            ExecExpiration::Timeout(duration) => tokio::time::sleep(duration).await,
+            ExecExpiration::Timeout(duration) => {
+                tokio::time::sleep(duration).await;
+                ExecExpirationOutcome::TimedOut
+            }
             ExecExpiration::DefaultTimeout => {
-                tokio::time::sleep(Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)).await
+                tokio::time::sleep(Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)).await;
+                ExecExpirationOutcome::TimedOut
             }
             ExecExpiration::Cancellation(cancel) => {
                 cancel.cancelled().await;
+                ExecExpirationOutcome::Cancelled
+            }
+            ExecExpiration::TimeoutOrCancellation {
+                timeout,
+                cancellation,
+            } => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => ExecExpirationOutcome::Cancelled,
+                    _ = tokio::time::sleep(timeout) => ExecExpirationOutcome::TimedOut,
+                }
             }
         }
     }
@@ -184,8 +216,50 @@ impl ExecExpiration {
             ExecExpiration::Timeout(duration) => Some(duration.as_millis() as u64),
             ExecExpiration::DefaultTimeout => Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
             ExecExpiration::Cancellation(_) => None,
+            ExecExpiration::TimeoutOrCancellation { timeout, .. } => {
+                Some(timeout.as_millis() as u64)
+            }
         }
     }
+
+    pub(crate) fn with_cancellation(self, cancellation: CancellationToken) -> Self {
+        match self {
+            ExecExpiration::Timeout(timeout) => ExecExpiration::TimeoutOrCancellation {
+                timeout,
+                cancellation,
+            },
+            ExecExpiration::DefaultTimeout => ExecExpiration::TimeoutOrCancellation {
+                timeout: Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS),
+                cancellation,
+            },
+            ExecExpiration::Cancellation(existing) => {
+                ExecExpiration::Cancellation(cancel_when_either(existing, cancellation))
+            }
+            ExecExpiration::TimeoutOrCancellation {
+                timeout,
+                cancellation: existing,
+            } => ExecExpiration::TimeoutOrCancellation {
+                timeout,
+                cancellation: cancel_when_either(existing, cancellation),
+            },
+        }
+    }
+}
+
+pub(crate) fn cancel_when_either(
+    first: CancellationToken,
+    second: CancellationToken,
+) -> CancellationToken {
+    let combined = CancellationToken::new();
+    let cancel = combined.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = first.cancelled() => {}
+            _ = second.cancelled() => {}
+        }
+        cancel.cancel();
+    });
+    combined
 }
 
 impl ExecCapturePolicy {
@@ -218,19 +292,15 @@ pub struct StdoutStream {
 #[allow(clippy::too_many_arguments)]
 pub async fn process_exec_tool_call(
     params: ExecParams,
-    sandbox_policy: &SandboxPolicy,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_cwd: &Path,
+    permission_profile: &PermissionProfile,
+    sandbox_cwd: &AbsolutePathBuf,
     codex_linux_sandbox_exe: &Option<PathBuf>,
     use_legacy_landlock: bool,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
     let exec_req = build_exec_request(
         params,
-        sandbox_policy,
-        file_system_sandbox_policy,
-        network_sandbox_policy,
+        permission_profile,
         sandbox_cwd,
         codex_linux_sandbox_exe,
         use_legacy_landlock,
@@ -244,23 +314,11 @@ pub async fn process_exec_tool_call(
 /// spawned under the requested sandbox policy.
 pub fn build_exec_request(
     params: ExecParams,
-    sandbox_policy: &SandboxPolicy,
-    file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_cwd: &Path,
+    permission_profile: &PermissionProfile,
+    sandbox_cwd: &AbsolutePathBuf,
     codex_linux_sandbox_exe: &Option<PathBuf>,
     use_legacy_landlock: bool,
 ) -> Result<ExecRequest> {
-    let windows_sandbox_level = params.windows_sandbox_level;
-    let enforce_managed_network = params.network.is_some();
-    let sandbox_type = select_process_exec_tool_sandbox_type(
-        file_system_sandbox_policy,
-        network_sandbox_policy,
-        windows_sandbox_level,
-        enforce_managed_network,
-    );
-    tracing::debug!("Sandbox type: {sandbox_type:?}");
-
     let ExecParams {
         command,
         cwd,
@@ -268,12 +326,27 @@ pub fn build_exec_request(
         expiration,
         capture_policy,
         network,
-        sandbox_permissions: _,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
-        justification: _,
+
+        // TODO: Should arg0 be set on the ExecRequest that is returned?
         arg0: _,
+        // These fields are related to approvals, so can be ignored here.
+        justification: _,
+        sandbox_permissions: _,
     } = params;
+
+    let enforce_managed_network = network.is_some();
+    let (file_system_sandbox_policy, network_sandbox_policy) =
+        permission_profile.to_runtime_permissions();
+    let sandbox_type = select_process_exec_tool_sandbox_type(
+        &file_system_sandbox_policy,
+        network_sandbox_policy,
+        windows_sandbox_level,
+        enforce_managed_network,
+    );
+    tracing::debug!("Sandbox type: {sandbox_type:?}");
+
     if let Some(network) = network.as_ref() {
         network.apply_to_env(&mut env);
     }
@@ -299,9 +372,7 @@ pub fn build_exec_request(
     let mut exec_req = manager
         .transform(SandboxTransformRequest {
             command,
-            policy: sandbox_policy,
-            file_system_policy: file_system_sandbox_policy,
-            network_policy: network_sandbox_policy,
+            permissions: permission_profile,
             sandbox: sandbox_type,
             enforce_managed_network,
             network: network.as_ref(),
@@ -311,16 +382,21 @@ pub fn build_exec_request(
             windows_sandbox_level,
             windows_sandbox_private_desktop,
         })
-        .map(|request| ExecRequest::from_sandbox_exec_request(request, options))
+        .map(|request| {
+            let windows_sandbox_policy_cwd = AbsolutePathBuf::try_from(sandbox_cwd.to_path_buf())
+                .unwrap_or_else(|_| request.cwd.clone());
+            ExecRequest::from_sandbox_exec_request(request, options, windows_sandbox_policy_cwd)
+        })
         .map_err(CodexErr::from)?;
     let use_windows_elevated_backend = windows_sandbox_uses_elevated_backend(
         exec_req.windows_sandbox_level,
         exec_req.network.is_some(),
     );
+    let sandbox_policy = exec_req.compatibility_sandbox_policy();
     exec_req.windows_sandbox_filesystem_overrides = if use_windows_elevated_backend {
         resolve_windows_elevated_filesystem_overrides(
             exec_req.sandbox,
-            &exec_req.sandbox_policy,
+            &sandbox_policy,
             &exec_req.file_system_sandbox_policy,
             exec_req.network_sandbox_policy,
             sandbox_cwd,
@@ -329,7 +405,7 @@ pub fn build_exec_request(
     } else {
         resolve_windows_restricted_token_filesystem_overrides(
             exec_req.sandbox,
-            &exec_req.sandbox_policy,
+            &sandbox_policy,
             &exec_req.file_system_sandbox_policy,
             exec_req.network_sandbox_policy,
             sandbox_cwd,
@@ -345,6 +421,7 @@ pub(crate) async fn execute_exec_request(
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<ExecToolCallOutput> {
+    let sandbox_policy = exec_request.compatibility_sandbox_policy();
     let ExecRequest {
         command,
         cwd,
@@ -354,10 +431,11 @@ pub(crate) async fn execute_exec_request(
         expiration,
         capture_policy,
         sandbox,
+        windows_sandbox_policy_cwd: _,
         windows_sandbox_level,
         windows_sandbox_private_desktop,
-        sandbox_policy,
-        file_system_sandbox_policy,
+        permission_profile: _,
+        file_system_sandbox_policy: _,
         network_sandbox_policy,
         windows_sandbox_filesystem_overrides,
         arg0,
@@ -378,19 +456,38 @@ pub(crate) async fn execute_exec_request(
     };
 
     let start = Instant::now();
-    let raw_output_result = exec(
+    let raw_output_result = get_raw_output_result(
         params,
-        sandbox,
-        &sandbox_policy,
-        &file_system_sandbox_policy,
-        windows_sandbox_filesystem_overrides.as_ref(),
         network_sandbox_policy,
         stdout_stream,
         after_spawn,
+        sandbox,
+        &sandbox_policy,
+        windows_sandbox_filesystem_overrides.as_ref(),
     )
     .await;
     let duration = start.elapsed();
     finalize_exec_result(raw_output_result, sandbox, duration)
+}
+
+async fn get_raw_output_result(
+    params: ExecParams,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    stdout_stream: Option<StdoutStream>,
+    after_spawn: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg_attr(not(windows), allow(unused_variables))] sandbox: SandboxType,
+    #[cfg_attr(not(windows), allow(unused_variables))] sandbox_policy: &SandboxPolicy,
+    #[cfg_attr(not(windows), allow(unused_variables))] windows_sandbox_filesystem_overrides: Option<
+        &WindowsSandboxFilesystemOverrides,
+    >,
+) -> Result<RawExecToolCallOutput> {
+    #[cfg(target_os = "windows")]
+    if sandbox == SandboxType::WindowsRestrictedToken {
+        return exec_windows_sandbox(params, sandbox_policy, windows_sandbox_filesystem_overrides)
+            .await;
+    }
+
+    exec(params, network_sandbox_policy, stdout_stream, after_spawn).await
 }
 
 #[cfg(target_os = "windows")]
@@ -518,6 +615,8 @@ async fn exec_windows_sandbox(
         .unwrap_or_default();
     let elevated_read_roots_override = windows_sandbox_filesystem_overrides
         .and_then(|overrides| overrides.read_roots_override.clone());
+    let elevated_read_roots_include_platform_defaults = windows_sandbox_filesystem_overrides
+        .is_some_and(|overrides| overrides.read_roots_include_platform_defaults);
     let elevated_write_roots_override = windows_sandbox_filesystem_overrides
         .and_then(|overrides| overrides.write_roots_override.clone());
     let elevated_deny_write_paths = windows_sandbox_filesystem_overrides
@@ -543,6 +642,8 @@ async fn exec_windows_sandbox(
                     use_private_desktop: windows_sandbox_private_desktop,
                     proxy_enforced,
                     read_roots_override: elevated_read_roots_override.as_deref(),
+                    read_roots_include_platform_defaults:
+                        elevated_read_roots_include_platform_defaults,
                     write_roots_override: elevated_write_roots_override.as_deref(),
                     deny_write_paths_override: &elevated_deny_write_paths,
                 },
@@ -799,26 +900,24 @@ fn aggregate_output(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// This is a general-purpose function for executing a command specified by
+/// [ExecParams]. Events are reported via `stdout_stream`, if specified, and
+/// `after_spawn` is invoked once the child process has been spawned, before
+/// output consumption begins.
+///
+/// `network_sandbox_policy` is used to determine whether
+/// CODEX_SANDBOX_NETWORK_DISABLED=1 is added to the environment of the spawned
+/// process.
+///
+/// Note this command does not apply any sandboxing logic. The caller is
+/// responsible for constructing [ExecParams::command] to include any sandboxing
+/// wrapper args, as appropriate.
 async fn exec(
     params: ExecParams,
-    _sandbox: SandboxType,
-    _sandbox_policy: &SandboxPolicy,
-    _file_system_sandbox_policy: &FileSystemSandboxPolicy,
-    _windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
     network_sandbox_policy: NetworkSandboxPolicy,
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<RawExecToolCallOutput> {
-    #[cfg(target_os = "windows")]
-    if _sandbox == SandboxType::WindowsRestrictedToken {
-        return exec_windows_sandbox(
-            params,
-            _sandbox_policy,
-            _windows_sandbox_filesystem_overrides,
-        )
-        .await;
-    }
     let ExecParams {
         command,
         cwd,
@@ -827,8 +926,14 @@ async fn exec(
         arg0,
         expiration,
         capture_policy,
+
+        // If applicable, these fields should have been honored upstream of
+        // this exec call.
         windows_sandbox_level: _,
-        ..
+        windows_sandbox_private_desktop: _,
+        // These fields are related to approvals, so can be ignored here.
+        sandbox_permissions: _,
+        justification: _,
     } = params;
     if let Some(network) = network.as_ref() {
         network.apply_to_env(&mut env);
@@ -845,7 +950,7 @@ async fn exec(
         program: PathBuf::from(program),
         args: args.into(),
         arg0: arg0_ref,
-        cwd: cwd.to_path_buf(),
+        cwd,
         network_sandbox_policy,
         // The environment already has attempt-scoped proxy settings from
         // apply_to_env_for_attempt above. Passing network here would reapply
@@ -881,7 +986,7 @@ pub(crate) fn unsupported_windows_restricted_token_sandbox_reason(
     sandbox_policy: &SandboxPolicy,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
+    sandbox_policy_cwd: &AbsolutePathBuf,
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> Option<String> {
     if windows_sandbox_level == WindowsSandboxLevel::Elevated {
@@ -912,7 +1017,7 @@ pub(crate) fn resolve_windows_restricted_token_filesystem_overrides(
     sandbox_policy: &SandboxPolicy,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
+    sandbox_policy_cwd: &AbsolutePathBuf,
     windows_sandbox_level: WindowsSandboxLevel,
 ) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
     if sandbox != SandboxType::WindowsRestrictedToken
@@ -954,6 +1059,9 @@ pub(crate) fn resolve_windows_restricted_token_filesystem_overrides(
     if !file_system_sandbox_policy
         .get_unreadable_roots_with_cwd(sandbox_policy_cwd)
         .is_empty()
+        || !file_system_sandbox_policy
+            .get_unreadable_globs_with_cwd(sandbox_policy_cwd)
+            .is_empty()
     {
         return Err(
             "windows unelevated restricted-token sandbox cannot enforce unreadable split filesystem carveouts directly; refusing to run unsandboxed"
@@ -1029,6 +1137,7 @@ pub(crate) fn resolve_windows_restricted_token_filesystem_overrides(
 
     Ok(Some(WindowsSandboxFilesystemOverrides {
         read_roots_override: None,
+        read_roots_include_platform_defaults: false,
         write_roots_override: None,
         additional_deny_write_paths: additional_deny_write_paths
             .into_iter()
@@ -1048,7 +1157,7 @@ pub(crate) fn resolve_windows_elevated_filesystem_overrides(
     sandbox_policy: &SandboxPolicy,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     network_sandbox_policy: NetworkSandboxPolicy,
-    sandbox_policy_cwd: &Path,
+    sandbox_policy_cwd: &AbsolutePathBuf,
     use_windows_elevated_backend: bool,
 ) -> std::result::Result<Option<WindowsSandboxFilesystemOverrides>, String> {
     if sandbox != SandboxType::WindowsRestrictedToken || !use_windows_elevated_backend {
@@ -1069,6 +1178,9 @@ pub(crate) fn resolve_windows_elevated_filesystem_overrides(
     if !file_system_sandbox_policy
         .get_unreadable_roots_with_cwd(sandbox_policy_cwd)
         .is_empty()
+        || !file_system_sandbox_policy
+            .get_unreadable_globs_with_cwd(sandbox_policy_cwd)
+            .is_empty()
     {
         return Err(
             "windows elevated sandbox cannot enforce unreadable split filesystem carveouts directly; refusing to run unsandboxed"
@@ -1089,12 +1201,6 @@ pub(crate) fn resolve_windows_elevated_filesystem_overrides(
         .needs_direct_runtime_enforcement(network_sandbox_policy, sandbox_policy_cwd);
     let normalize_path = |path: PathBuf| dunce::canonicalize(&path).unwrap_or(path);
     let legacy_writable_roots = sandbox_policy.get_writable_roots_with_cwd(sandbox_policy_cwd);
-    let legacy_readable_root_set: BTreeSet<PathBuf> = sandbox_policy
-        .get_readable_roots_with_cwd(sandbox_policy_cwd)
-        .into_iter()
-        .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
-        .map(&normalize_path)
-        .collect();
     let legacy_root_paths: BTreeSet<PathBuf> = legacy_writable_roots
         .iter()
         .map(|root| normalize_path(root.root.to_path_buf()))
@@ -1105,19 +1211,13 @@ pub(crate) fn resolve_windows_elevated_filesystem_overrides(
         .map(codex_utils_absolute_path::AbsolutePathBuf::into_path_buf)
         .map(&normalize_path)
         .collect();
-    let split_readable_root_set: BTreeSet<PathBuf> = split_readable_roots.iter().cloned().collect();
     let split_root_paths: Vec<PathBuf> = split_writable_roots
         .iter()
         .map(|root| normalize_path(root.root.to_path_buf()))
         .collect();
     let split_root_path_set: BTreeSet<PathBuf> = split_root_paths.iter().cloned().collect();
 
-    let matches_legacy_read_access = file_system_sandbox_policy.has_full_disk_read_access()
-        == sandbox_policy.has_full_disk_read_access();
-    let read_roots_override = if matches_legacy_read_access
-        && (file_system_sandbox_policy.has_full_disk_read_access()
-            || split_readable_root_set == legacy_readable_root_set)
-    {
+    let read_roots_override = if file_system_sandbox_policy.has_full_disk_read_access() {
         None
     } else {
         Some(split_readable_roots)
@@ -1171,6 +1271,8 @@ pub(crate) fn resolve_windows_elevated_filesystem_overrides(
     }
 
     Ok(Some(WindowsSandboxFilesystemOverrides {
+        read_roots_include_platform_defaults: read_roots_override.is_some()
+            && file_system_sandbox_policy.include_platform_defaults(),
         read_roots_override,
         write_roots_override,
         additional_deny_write_paths,
@@ -1235,9 +1337,9 @@ async fn consume_output(
 
     let expiration_wait = async {
         if capture_policy.uses_expiration() {
-            expiration.wait().await;
+            Some(expiration.wait_with_outcome().await)
         } else {
-            std::future::pending::<()>().await;
+            std::future::pending::<Option<ExecExpirationOutcome>>().await
         }
     };
     tokio::pin!(expiration_wait);
@@ -1246,10 +1348,16 @@ async fn consume_output(
             let exit_status = status_result?;
             (exit_status, false)
         }
-        _ = &mut expiration_wait => {
+        outcome = &mut expiration_wait => {
             kill_child_process_group(&mut child)?;
             child.start_kill()?;
-            (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE), true)
+            let timed_out = matches!(outcome, Some(ExecExpirationOutcome::TimedOut));
+            let exit_status = if timed_out {
+                synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE)
+            } else {
+                synthetic_exit_status_for_code(/*code*/ 1)
+            };
+            (exit_status, timed_out)
         }
         _ = tokio::signal::ctrl_c() => {
             kill_child_process_group(&mut child)?;
@@ -1359,12 +1467,23 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
     std::process::ExitStatus::from_raw(code)
 }
 
+#[cfg(unix)]
+fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
 #[cfg(windows)]
 fn synthetic_exit_status(code: i32) -> ExitStatus {
     use std::os::windows::process::ExitStatusExt;
     // On Windows the raw status is a u32. Use a direct cast to avoid
     // panicking on negative i32 values produced by prior narrowing casts.
     std::process::ExitStatus::from_raw(code as u32)
+}
+
+#[cfg(windows)]
+fn synthetic_exit_status_for_code(code: i32) -> ExitStatus {
+    synthetic_exit_status(code)
 }
 
 #[cfg(test)]

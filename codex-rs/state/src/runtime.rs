@@ -20,9 +20,12 @@ use crate::apply_rollout_item;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_state_migrator;
 use crate::model::AgentJobRow;
+use crate::model::ThreadGoalRow;
 use crate::model::ThreadRow;
 use crate::model::anchor_from_item;
+use crate::model::datetime_to_epoch_millis;
 use crate::model::datetime_to_epoch_seconds;
+use crate::model::epoch_millis_to_datetime;
 use crate::paths::file_modified_time_utc;
 use chrono::DateTime;
 use chrono::Utc;
@@ -47,11 +50,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI64;
 use std::time::Duration;
 use tracing::warn;
 
 mod agent_jobs;
 mod backfill;
+mod goals;
 mod logs;
 mod memories;
 mod remote_control;
@@ -59,7 +64,11 @@ mod remote_control;
 mod test_support;
 mod threads;
 
+pub use goals::ThreadGoalAccountingMode;
+pub use goals::ThreadGoalAccountingOutcome;
+pub use goals::ThreadGoalUpdate;
 pub use remote_control::RemoteControlEnrollmentRecord;
+pub use threads::ThreadFilterOptions;
 
 // "Partition" is the retained-log-content bucket we cap at 10 MiB:
 // - one bucket per non-null thread_id
@@ -76,6 +85,7 @@ pub struct StateRuntime {
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
     logs_pool: Arc<sqlx::SqlitePool>,
+    thread_updated_at_millis: Arc<AtomicI64>,
 }
 
 impl StateRuntime {
@@ -120,11 +130,17 @@ impl StateRuntime {
                 return Err(err);
             }
         };
+        let thread_updated_at_millis: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(threads.updated_at_ms) FROM threads")
+                .fetch_one(pool.as_ref())
+                .await?;
+        let thread_updated_at_millis = thread_updated_at_millis.unwrap_or(0);
         let runtime = Arc::new(Self {
             pool,
             logs_pool,
             codex_home,
             default_provider,
+            thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
         });
         if let Err(err) = runtime.run_logs_startup_maintenance().await {
             warn!(
@@ -152,28 +168,15 @@ fn base_sqlite_options(path: &Path) -> SqliteConnectOptions {
 }
 
 async fn open_state_sqlite(path: &Path, migrator: &Migrator) -> anyhow::Result<SqlitePool> {
+    // New state DBs should use incremental auto-vacuum, but retrofitting an
+    // existing DB requires a full VACUUM. Do not attempt that during process
+    // startup: it is maintenance work that can contend with foreground writers.
     let options = base_sqlite_options(path).auto_vacuum(SqliteAutoVacuum::Incremental);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)
         .await?;
     migrator.run(&pool).await?;
-    let auto_vacuum = sqlx::query_scalar::<_, i64>("PRAGMA auto_vacuum")
-        .fetch_one(&pool)
-        .await?;
-    if auto_vacuum != SqliteAutoVacuum::Incremental as i64 {
-        // Existing state DBs need one non-transactional `VACUUM` before
-        // SQLite persists `auto_vacuum = INCREMENTAL` in the database header.
-        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
-            .execute(&pool)
-            .await?;
-        // We do it on best effort. If the lock can't be acquired, it will be done at next run.
-        let _ = sqlx::query("VACUUM").execute(&pool).await;
-    }
-    // We do it on best effort. If the lock can't be acquired, it will be done at next run.
-    let _ = sqlx::query("PRAGMA incremental_vacuum")
-        .execute(&pool)
-        .await;
     Ok(pool)
 }
 
@@ -223,6 +226,7 @@ async fn remove_legacy_db_files(
             return;
         }
     };
+    let mut legacy_paths = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         if !entry
             .file_type()
@@ -238,8 +242,23 @@ async fn remove_legacy_db_files(
             continue;
         }
 
-        let legacy_path = entry.path();
-        if let Err(err) = tokio::fs::remove_file(&legacy_path).await {
+        legacy_paths.push(entry.path());
+    }
+
+    // On Windows, SQLite can keep the main database file undeletable until the
+    // matching `-wal` / `-shm` sidecars are removed. Remove the longest
+    // sidecar-style paths first so the main file is attempted last.
+    legacy_paths.sort_by_key(|path| std::cmp::Reverse(path.as_os_str().len()));
+    for legacy_path in legacy_paths {
+        let mut result = tokio::fs::remove_file(&legacy_path).await;
+        for _ in 0..3 {
+            if result.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            result = tokio::fs::remove_file(&legacy_path).await;
+        }
+        if let Err(err) = result {
             warn!(
                 "failed to remove legacy {db_label} db file {}: {err}",
                 legacy_path.display(),
