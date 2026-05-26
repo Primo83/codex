@@ -90,6 +90,7 @@ pub struct PluginsConfigInput {
     pub config_layer_stack: ConfigLayerStack,
     pub plugins_enabled: bool,
     pub remote_plugin_enabled: bool,
+    pub plugin_hooks_enabled: bool,
     pub chatgpt_base_url: String,
 }
 
@@ -98,12 +99,14 @@ impl PluginsConfigInput {
         config_layer_stack: ConfigLayerStack,
         plugins_enabled: bool,
         remote_plugin_enabled: bool,
+        plugin_hooks_enabled: bool,
         chatgpt_base_url: String,
     ) -> Self {
         Self {
             config_layer_stack,
             plugins_enabled,
             remote_plugin_enabled,
+            plugin_hooks_enabled,
             chatgpt_base_url,
         }
     }
@@ -412,6 +415,7 @@ pub struct PluginsManager {
 #[derive(Clone)]
 struct CachedPluginLoadOutcome {
     config_version: String,
+    plugin_hooks_enabled: bool,
     outcome: PluginLoadOutcome,
 }
 
@@ -482,8 +486,12 @@ impl PluginsManager {
             return PluginLoadOutcome::default();
         }
 
+        let plugin_hooks_enabled = config.plugin_hooks_enabled;
         let config_version = version_for_toml(&config.config_layer_stack.effective_config());
-        if !force_reload && let Some(outcome) = self.cached_enabled_outcome(&config_version) {
+        if !force_reload
+            && let Some(outcome) =
+                self.cached_enabled_outcome(&config_version, plugin_hooks_enabled)
+        {
             return outcome;
         }
 
@@ -492,6 +500,7 @@ impl PluginsManager {
             self.remote_installed_plugin_configs(),
             &self.store,
             self.restriction_product,
+            plugin_hooks_enabled,
         )
         .await;
         log_plugin_load_errors(&outcome);
@@ -501,6 +510,7 @@ impl PluginsManager {
         };
         *cache = Some(CachedPluginLoadOutcome {
             config_version,
+            plugin_hooks_enabled,
             outcome: outcome.clone(),
         });
         outcome
@@ -528,6 +538,7 @@ impl PluginsManager {
         &self,
         config_layer_stack: &ConfigLayerStack,
         config: &PluginsConfigInput,
+        plugin_hooks_feature_enabled: bool,
     ) -> PluginLoadOutcome {
         if !config.plugins_enabled {
             return PluginLoadOutcome::default();
@@ -537,6 +548,7 @@ impl PluginsManager {
             self.remote_installed_plugin_configs(),
             &self.store,
             self.restriction_product,
+            plugin_hooks_feature_enabled,
         )
         .await
     }
@@ -547,21 +559,31 @@ impl PluginsManager {
         config_layer_stack: &ConfigLayerStack,
         config: &PluginsConfigInput,
     ) -> Vec<PluginSkillRoot> {
-        self.plugins_for_layer_stack(config_layer_stack, config)
+        self.plugins_for_layer_stack(config_layer_stack, config, config.plugin_hooks_enabled)
             .await
             .effective_plugin_skill_roots()
     }
 
-    fn cached_enabled_outcome(&self, config_version: &str) -> Option<PluginLoadOutcome> {
+    fn cached_enabled_outcome(
+        &self,
+        config_version: &str,
+        plugin_hooks_enabled: bool,
+    ) -> Option<PluginLoadOutcome> {
         match self.cached_enabled_outcome.read() {
             Ok(cache) => cache
                 .as_ref()
-                .filter(|cached| cached.config_version == config_version)
+                .filter(|cached| {
+                    cached.config_version == config_version
+                        && cached.plugin_hooks_enabled == plugin_hooks_enabled
+                })
                 .map(|cached| cached.outcome.clone()),
             Err(err) => err
                 .into_inner()
                 .as_ref()
-                .filter(|cached| cached.config_version == config_version)
+                .filter(|cached| {
+                    cached.config_version == config_version
+                        && cached.plugin_hooks_enabled == plugin_hooks_enabled
+                })
                 .map(|cached| cached.outcome.clone()),
         }
     }
@@ -1429,16 +1451,20 @@ impl PluginsManager {
             ),
         )
         .await;
-        let plugin_data_root = self.store.plugin_data_root(&plugin_id);
-        let (hook_sources, _hook_load_warnings) =
-            load_plugin_hooks(&source_path, &plugin_id, &plugin_data_root, &manifest.paths);
-        let hooks = plugin_hook_declarations(&hook_sources)
-            .into_iter()
-            .map(|hook| PluginHookSummary {
-                key: hook.key,
-                event_name: hook.event_name,
-            })
-            .collect();
+        let hooks = if config.plugin_hooks_enabled {
+            let plugin_data_root = self.store.plugin_data_root(&plugin_id);
+            let (hook_sources, _hook_load_warnings) =
+                load_plugin_hooks(&source_path, &plugin_id, &plugin_data_root, &manifest.paths);
+            plugin_hook_declarations(&hook_sources)
+                .into_iter()
+                .map(|hook| PluginHookSummary {
+                    key: hook.key,
+                    event_name: hook.event_name,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let apps = load_plugin_apps(source_path.as_path()).await;
         let mut mcp_server_names = load_plugin_mcp_servers(source_path.as_path())
             .await

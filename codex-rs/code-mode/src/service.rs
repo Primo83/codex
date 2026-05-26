@@ -73,8 +73,12 @@ impl CodeModeService {
         }
     }
 
-    async fn stored_values(&self) -> HashMap<String, JsonValue> {
+    pub async fn stored_values(&self) -> HashMap<String, JsonValue> {
         self.inner.stored_values.lock().await.clone()
+    }
+
+    pub async fn replace_stored_values(&self, values: HashMap<String, JsonValue>) {
+        *self.inner.stored_values.lock().await = values;
     }
 
     /// Reserves the runtime cell id for a future `execute` request.
@@ -134,7 +138,6 @@ impl CodeModeService {
         let cell_id = request.cell_id.clone();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let stored_values = self.stored_values().await;
         let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = {
             let mut sessions = self.inner.sessions.lock().await;
             if sessions.contains_key(&cell_id) {
@@ -142,7 +145,7 @@ impl CodeModeService {
             }
 
             let (runtime_tx, runtime_control_tx, runtime_terminate_handle) =
-                spawn_runtime(stored_values, request, event_tx, pending_mode)?;
+                spawn_runtime(request, event_tx, pending_mode)?;
 
             // Keep the session registry locked through insertion so a
             // caller-owned cell id cannot race with another execute and replace
@@ -346,6 +349,7 @@ enum SessionResponseSender {
 
 struct PendingResult {
     content_items: Vec<FunctionCallOutputContentItem>,
+    stored_values: HashMap<String, JsonValue>,
     error_text: Option<String>,
 }
 
@@ -362,6 +366,7 @@ fn missing_cell_response(cell_id: String) -> RuntimeResponse {
         error_text: Some(format!("exec cell {cell_id} not found")),
         cell_id,
         content_items: Vec::new(),
+        stored_values: HashMap::new(),
     }
 }
 
@@ -369,6 +374,7 @@ fn pending_result_response(cell_id: &str, result: PendingResult) -> RuntimeRespo
     RuntimeResponse::Result {
         cell_id: cell_id.to_string(),
         content_items: result.content_items,
+        stored_values: result.stored_values,
         error_text: result.error_text,
     }
 }
@@ -470,6 +476,7 @@ async fn run_session_control(
                     if pending_result.is_none() {
                         let result = PendingResult {
                             content_items: std::mem::take(&mut content_items),
+                            stored_values: HashMap::new(),
                             error_text: Some("exec runtime ended unexpectedly".to_string()),
                         };
                         if send_or_buffer_result(
@@ -544,7 +551,7 @@ async fn run_session_control(
                             .await;
                     }
                     RuntimeEvent::Result {
-                        stored_value_writes,
+                        stored_values,
                         error_text,
                     } => {
                         yield_timer = None;
@@ -558,13 +565,9 @@ async fn run_session_control(
                             }
                             break;
                         }
-                        inner
-                            .stored_values
-                            .lock()
-                            .await
-                            .extend(stored_value_writes);
                         let result = PendingResult {
                             content_items: std::mem::take(&mut content_items),
+                            stored_values,
                             error_text,
                         };
                         if send_or_buffer_result(
@@ -712,6 +715,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),
+            stored_values: HashMap::new(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
         }
@@ -748,6 +752,7 @@ mod tests {
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "before".to_string(),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -773,6 +778,7 @@ mod tests {
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "done".to_string(),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             })
         );
@@ -1102,6 +1108,7 @@ text("done");
                     content_items: vec![FunctionCallOutputContentItem::InputText {
                         text: "done".to_string(),
                     }],
+                    stored_values: HashMap::new(),
                     error_text: None,
                 }
             ))
@@ -1128,6 +1135,7 @@ text("done");
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "false".to_string(),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1167,6 +1175,7 @@ text(value);
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1205,6 +1214,7 @@ text(formatter.format(new Date("2025-01-02T03:04:05Z")));
                 content_items: vec![FunctionCallOutputContentItem::InputText {
                     text: "jeudi 2 janvier \u{e0} 03:04:05".to_string(),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1247,6 +1257,7 @@ text(JSON.stringify(returnsUndefined));
                         text: "[true,true,true]".to_string(),
                     },
                 ],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1281,6 +1292,7 @@ image({
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::Original),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1316,6 +1328,7 @@ image(
                     image_url: "https://example.com/image.jpg".to_string(),
                     detail: Some(crate::ImageDetail::Original),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1353,6 +1366,7 @@ image(
                     image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==".to_string(),
                     detail: Some(crate::ImageDetail::High),
                 }],
+                stored_values: HashMap::new(),
                 error_text: None,
             }
         );
@@ -1382,6 +1396,7 @@ image({
             RuntimeResponse::Result {
                 cell_id: "1".to_string(),
                 content_items: Vec::new(),
+                stored_values: HashMap::new(),
                 error_text: Some("image detail must be one of: high, original".to_string()),
             }
         );
@@ -1418,6 +1433,7 @@ image({
             RuntimeResponse::Result {
                 cell_id: "1".to_string(),
                 content_items: Vec::new(),
+                stored_values: HashMap::new(),
                 error_text: Some(
                     "image expects a non-empty image URL string, an object with image_url and optional detail, or a raw MCP image block".to_string(),
                 ),
@@ -1443,6 +1459,7 @@ image({
             WaitOutcome::MissingCell(RuntimeResponse::Result {
                 cell_id: "missing".to_string(),
                 content_items: Vec::new(),
+                stored_values: HashMap::new(),
                 error_text: Some("exec cell missing not found".to_string()),
             })
         );
@@ -1456,7 +1473,6 @@ image({
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
         let (runtime_event_tx, _runtime_event_rx) = mpsc::unbounded_channel();
         let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
-            HashMap::new(),
             ExecuteRequest {
                 source: "await new Promise(() => {})".to_string(),
                 yield_time_ms: None,

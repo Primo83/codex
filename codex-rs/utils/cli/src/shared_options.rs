@@ -30,8 +30,12 @@ pub struct SharedCliOptions {
     #[arg(long = "local-provider")]
     pub oss_provider: Option<String>,
 
-    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    /// Configuration profile from config.toml to specify default options.
     #[arg(long = "profile", short = 'p')]
+    pub config_profile: Option<String>,
+
+    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    #[arg(long = "profile-v2")]
     pub config_profile_v2: Option<ProfileV2Name>,
 
     /// Select the sandbox policy to use when executing model-generated shell
@@ -71,6 +75,7 @@ impl SharedCliOptions {
             model,
             oss,
             oss_provider,
+            config_profile,
             config_profile_v2,
             sandbox_mode,
             dangerously_bypass_approvals_and_sandbox,
@@ -83,6 +88,7 @@ impl SharedCliOptions {
             model: root_model,
             oss: root_oss,
             oss_provider: root_oss_provider,
+            config_profile: root_config_profile,
             config_profile_v2: root_config_profile_v2,
             sandbox_mode: root_sandbox_mode,
             dangerously_bypass_approvals_and_sandbox: root_dangerously_bypass_approvals_and_sandbox,
@@ -99,6 +105,9 @@ impl SharedCliOptions {
         }
         if oss_provider.is_none() {
             oss_provider.clone_from(root_oss_provider);
+        }
+        if config_profile.is_none() {
+            config_profile.clone_from(root_config_profile);
         }
         if config_profile_v2.is_none() {
             config_profile_v2.clone_from(root_config_profile_v2);
@@ -136,6 +145,7 @@ impl SharedCliOptions {
             model,
             oss,
             oss_provider,
+            config_profile,
             config_profile_v2,
             sandbox_mode,
             dangerously_bypass_approvals_and_sandbox,
@@ -152,6 +162,9 @@ impl SharedCliOptions {
         }
         if let Some(oss_provider) = oss_provider {
             self.oss_provider = Some(oss_provider);
+        }
+        if let Some(config_profile) = config_profile {
+            self.config_profile = Some(config_profile);
         }
         if let Some(config_profile_v2) = config_profile_v2 {
             self.config_profile_v2 = Some(config_profile_v2);

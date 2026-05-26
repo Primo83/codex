@@ -8,7 +8,6 @@ from pathlib import Path
 from .targets import REPO_ROOT
 from .targets import PackageVariant
 from .targets import TargetSpec
-from .v8 import resolve_codex_v8_cargo_env
 
 
 CODEX_RS_ROOT = REPO_ROOT / "codex-rs"
@@ -61,19 +60,8 @@ def build_source_binaries(
         for binary in binaries:
             cmd.extend(["--bin", binary])
 
-        cargo_env = None
-        if entrypoint_bin is None:
-            codex_v8_env = resolve_codex_v8_cargo_env(spec)
-            if codex_v8_env:
-                cargo_env = {**os.environ, **codex_v8_env}
-
         print("+", " ".join(cmd))
-        subprocess.run(
-            cmd,
-            cwd=CODEX_RS_ROOT,
-            check=True,
-            env=cargo_env,
-        )
+        subprocess.run(cmd, cwd=CODEX_RS_ROOT, check=True)
 
     output_dir = cargo_profile_output_dir(spec, profile)
     outputs = SourceBuildOutputs(

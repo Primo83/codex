@@ -686,7 +686,6 @@ pub(crate) enum AppEvent {
     OpenFullAccessConfirmation {
         preset: ApprovalPreset,
         return_to_permissions: bool,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Open the Windows world-writable directories warning.
@@ -696,7 +695,6 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWorldWritableWarningConfirmation {
         preset: Option<ApprovalPreset>,
-        profile_selection: Option<PermissionProfileSelection>,
         /// Up to 3 sample world-writable directories to display in the warning.
         sample_paths: Vec<String>,
         /// If there are more than `sample_paths`, this carries the remaining count.
@@ -709,28 +707,24 @@ pub(crate) enum AppEvent {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxEnablePrompt {
         preset: ApprovalPreset,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Open the Windows sandbox fallback prompt after declining or failing elevation.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     OpenWindowsSandboxFallbackPrompt {
         preset: ApprovalPreset,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the elevated Windows sandbox setup flow.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxElevatedSetup {
         preset: ApprovalPreset,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin the non-elevated Windows sandbox setup flow.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxLegacySetup {
         preset: ApprovalPreset,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Begin a non-elevated grant of read access for an additional directory.
@@ -751,7 +745,6 @@ pub(crate) enum AppEvent {
     EnableWindowsSandboxForAgentMode {
         preset: ApprovalPreset,
         mode: WindowsSandboxEnableMode,
-        profile_selection: Option<PermissionProfileSelection>,
     },
 
     /// Update the Windows sandbox feature mode without changing approval presets.
@@ -762,9 +755,6 @@ pub(crate) enum AppEvent {
 
     /// Update the current built-in active permission profile in the running app and widget.
     UpdateActivePermissionProfile(ActivePermissionProfile),
-
-    /// Select a named permission profile, optionally applying built-in mode settings too.
-    SelectPermissionProfile(PermissionProfileSelection),
 
     /// Update the current approvals reviewer in the running app and widget.
     UpdateApprovalsReviewer(ApprovalsReviewer),
@@ -1003,15 +993,6 @@ pub(crate) enum AppEvent {
         context: String,
         action: String,
     },
-}
-
-/// Named profile selection to apply after any required UI guardrails complete.
-#[derive(Debug, Clone)]
-pub(crate) struct PermissionProfileSelection {
-    pub profile_id: String,
-    pub approval_policy: Option<AskForApproval>,
-    pub approvals_reviewer: Option<ApprovalsReviewer>,
-    pub display_label: String,
 }
 
 #[derive(Debug)]

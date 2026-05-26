@@ -31,7 +31,10 @@ fn detects_subagent_notification_fragment_case_insensitively() {
 
 #[test]
 fn detects_goal_context_fragment() {
-    let text = GoalContext::new("Continue working toward the active thread goal.").render();
+    let text = GoalContext {
+        prompt: "Continue working toward the active thread goal.".to_string(),
+    }
+    .render();
 
     assert!(is_contextual_user_fragment(&ContentItem::InputText {
         text
@@ -40,9 +43,9 @@ fn detects_goal_context_fragment() {
 
 #[test]
 fn contextual_user_fragment_is_dyn_compatible() {
-    let fragment: Box<dyn ContextualUserFragment> = Box::new(GoalContext::new(
-        "Continue working toward the active thread goal.",
-    ));
+    let fragment: Box<dyn ContextualUserFragment> = Box::new(GoalContext {
+        prompt: "Continue working toward the active thread goal.".to_string(),
+    });
 
     assert_eq!(
         fragment.render(),

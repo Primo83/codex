@@ -312,10 +312,6 @@ impl RpcClient {
             })
     }
 
-    pub(crate) fn is_disconnected(&self) -> bool {
-        *self.disconnected_rx.borrow()
-    }
-
     pub(crate) async fn call<P, T>(&self, method: &str, params: &P) -> Result<T, RpcCallError>
     where
         P: Serialize,

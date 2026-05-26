@@ -2,12 +2,9 @@ use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
-use crate::tools::registry::PostToolUsePayload;
-use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -50,8 +47,8 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
         ToolName::plain(WAIT_TOOL_NAME)
     }
 
-    fn spec(&self) -> ToolSpec {
-        create_wait_tool()
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_wait_tool())
     }
 
     async fn handle(
@@ -113,22 +110,4 @@ impl ToolExecutor<ToolInvocation> for CodeModeWaitHandler {
     }
 }
 
-impl CoreToolRuntime for CodeModeWaitHandler {
-    fn pre_tool_use_payload(&self, _invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        // Code-mode `wait` is runtime control for an existing code cell, not a
-        // standalone user action. Tool calls made from code mode still flow
-        // through normal dispatch, but hooks should not block or rewrite the
-        // wait loop itself.
-        None
-    }
-
-    fn post_tool_use_payload(
-        &self,
-        _invocation: &ToolInvocation,
-        _result: &dyn ToolOutput,
-    ) -> Option<PostToolUsePayload> {
-        // The wait result feeds code-mode control flow, so do not let
-        // PostToolUse replace it with model-facing hook feedback.
-        None
-    }
-}
+impl CoreToolRuntime for CodeModeWaitHandler {}

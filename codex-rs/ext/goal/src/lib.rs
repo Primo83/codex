@@ -8,7 +8,6 @@ mod accounting;
 mod events;
 mod extension;
 mod spec;
-mod steering;
 mod tool;
 
 pub use extension::GoalExtension;

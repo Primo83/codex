@@ -322,7 +322,10 @@ fn goal_context_does_not_parse_as_visible_turn_item() {
         id: Some("msg-1".to_string()),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
-            text: GoalContext::new("Continue working toward the active thread goal.").render(),
+            text: GoalContext {
+                prompt: "Continue working toward the active thread goal.".to_string(),
+            }
+            .render(),
         }],
         phase: None,
     };

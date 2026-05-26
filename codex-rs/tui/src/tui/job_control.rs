@@ -175,12 +175,8 @@ impl PreparedResumeAction {
 /// Deliver SIGTSTP after restoring terminal state, then re-applies terminal modes once resumed.
 fn suspend_process() -> Result<()> {
     super::restore()?;
-    super::terminal_stderr::pause()?;
-    unsafe {
-        libc::kill(/*pid*/ 0, libc::SIGTSTP)
-    };
+    unsafe { libc::kill(0, libc::SIGTSTP) };
     // After the process resumes, reapply terminal modes so drawing can continue.
-    super::terminal_stderr::resume()?;
     super::set_modes()?;
     Ok(())
 }

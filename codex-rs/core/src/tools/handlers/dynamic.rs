@@ -31,7 +31,7 @@ use tracing::warn;
 
 pub struct DynamicToolHandler {
     tool_name: ToolName,
-    spec: ToolSpec,
+    spec: Option<ToolSpec>,
     exposure: ToolExposure,
     search_text: String,
 }
@@ -50,7 +50,7 @@ impl DynamicToolHandler {
         };
         Some(Self {
             tool_name,
-            spec,
+            spec: Some(spec),
             exposure: if tool.defer_loading {
                 ToolExposure::Deferred
             } else {
@@ -67,7 +67,7 @@ impl ToolExecutor<ToolInvocation> for DynamicToolHandler {
         self.tool_name.clone()
     }
 
-    fn spec(&self) -> ToolSpec {
+    fn spec(&self) -> Option<ToolSpec> {
         self.spec.clone()
     }
 
@@ -130,7 +130,7 @@ impl CoreToolRuntime for DynamicToolHandler {
     fn search_info(&self) -> Option<ToolSearchInfo> {
         ToolSearchInfo::from_spec(
             self.search_text.clone(),
-            self.spec(),
+            self.spec()?,
             Some(ToolSearchSourceInfo {
                 name: "Dynamic tools".to_string(),
                 description: Some("Tools provided by the current Codex thread.".to_string()),

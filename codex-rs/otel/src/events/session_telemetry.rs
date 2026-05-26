@@ -10,6 +10,7 @@ use crate::metrics::MetricsConfig;
 use crate::metrics::MetricsError;
 use crate::metrics::PLUGIN_INSTALL_ELICITATION_SENT_METRIC;
 use crate::metrics::PLUGIN_INSTALL_SUGGESTION_METRIC;
+use crate::metrics::PROFILE_USAGE_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_IAPI_TBT_DURATION_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_IAPI_TTFT_DURATION_METRIC;
 use crate::metrics::RESPONSES_API_ENGINE_SERVICE_TBT_DURATION_METRIC;
@@ -446,7 +447,11 @@ impl SessionTelemetry {
         approval_policy: AskForApproval,
         sandbox_policy: SandboxPolicy,
         mcp_servers: Vec<&str>,
+        active_profile: Option<String>,
     ) {
+        if active_profile.is_some() {
+            self.counter(PROFILE_USAGE_METRIC, /*inc*/ 1, &[]);
+        }
         log_and_trace_event!(
             self,
             common: {
@@ -467,9 +472,11 @@ impl SessionTelemetry {
             },
             log: {
                 mcp_servers = mcp_servers.join(", "),
+                active_profile = active_profile,
             },
             trace: {
                 mcp_server_count = mcp_servers.len() as i64,
+                active_profile_present = active_profile.is_some(),
             },
         );
     }

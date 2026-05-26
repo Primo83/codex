@@ -35,6 +35,7 @@ pub struct ExecuteRequest {
     pub tool_call_id: String,
     pub enabled_tools: Vec<ToolDefinition>,
     pub source: String,
+    pub stored_values: HashMap<String, JsonValue>,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
 }
@@ -115,6 +116,7 @@ pub enum RuntimeResponse {
     Result {
         cell_id: String,
         content_items: Vec<FunctionCallOutputContentItem>,
+        stored_values: HashMap<String, JsonValue>,
         error_text: Option<String>,
     },
 }
@@ -180,13 +182,12 @@ pub(crate) enum RuntimeEvent {
         text: String,
     },
     Result {
-        stored_value_writes: HashMap<String, JsonValue>,
+        stored_values: HashMap<String, JsonValue>,
         error_text: Option<String>,
     },
 }
 
 pub(crate) fn spawn_runtime(
-    stored_values: HashMap<String, JsonValue>,
     request: ExecuteRequest,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_mode: PendingRuntimeMode,
@@ -213,7 +214,7 @@ pub(crate) fn spawn_runtime(
         tool_call_id: request.tool_call_id,
         enabled_tools,
         source: request.source,
-        stored_values,
+        stored_values: request.stored_values,
     };
 
     thread::spawn(move || {
@@ -247,7 +248,6 @@ pub(super) struct RuntimeState {
     pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
     pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
     stored_values: HashMap<String, JsonValue>,
-    stored_value_writes: HashMap<String, JsonValue>,
     enabled_tools: Vec<EnabledToolMetadata>,
     next_tool_call_id: u64,
     next_timeout_id: u64,
@@ -259,7 +259,7 @@ pub(super) struct RuntimeState {
 pub(super) enum CompletionState {
     Pending,
     Completed {
-        stored_value_writes: HashMap<String, JsonValue>,
+        stored_values: HashMap<String, JsonValue>,
         error_text: Option<String>,
     },
 }
@@ -305,7 +305,6 @@ fn run_runtime(
         pending_tool_calls: HashMap::new(),
         pending_timeouts: HashMap::new(),
         stored_values: config.stored_values,
-        stored_value_writes: HashMap::new(),
         enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         next_timeout_id: 1,
@@ -331,10 +330,10 @@ fn run_runtime(
 
     match module_loader::completion_state(scope, pending_promise.as_ref()) {
         CompletionState::Completed {
-            stored_value_writes,
+            stored_values,
             error_text,
         } => {
-            send_result(&event_tx, stored_value_writes, error_text);
+            send_result(&event_tx, stored_values, error_text);
             return;
         }
         CompletionState::Pending => {}
@@ -376,10 +375,10 @@ fn run_runtime(
         scope.perform_microtask_checkpoint();
         match module_loader::completion_state(scope, pending_promise.as_ref()) {
             CompletionState::Completed {
-                stored_value_writes,
+                stored_values,
                 error_text,
             } => {
-                send_result(&event_tx, stored_value_writes, error_text);
+                send_result(&event_tx, stored_values, error_text);
                 return;
             }
             CompletionState::Pending => {}
@@ -423,21 +422,21 @@ fn capture_scope_send_error(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
     error_text: Option<String>,
 ) {
-    let stored_value_writes = scope
+    let stored_values = scope
         .get_slot::<RuntimeState>()
-        .map(|state| state.stored_value_writes.clone())
+        .map(|state| state.stored_values.clone())
         .unwrap_or_default();
 
-    send_result(event_tx, stored_value_writes, error_text);
+    send_result(event_tx, stored_values, error_text);
 }
 
 fn send_result(
     event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    stored_value_writes: HashMap<String, JsonValue>,
+    stored_values: HashMap<String, JsonValue>,
     error_text: Option<String>,
 ) {
     let _ = event_tx.send(RuntimeEvent::Result {
-        stored_value_writes,
+        stored_values,
         error_text,
     });
 }
@@ -464,6 +463,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),
+            stored_values: HashMap::new(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
         }
@@ -473,7 +473,6 @@ mod tests {
     async fn terminate_execution_stops_cpu_bound_module() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (_runtime_tx, _runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
-            HashMap::new(),
             execute_request("while (true) {}"),
             event_tx,
             PendingRuntimeMode::Continue,
@@ -492,9 +491,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let RuntimeEvent::Result { error_text, .. } = result_event else {
+        let RuntimeEvent::Result {
+            stored_values,
+            error_text,
+        } = result_event
+        else {
             panic!("expected runtime result after termination");
         };
+        assert_eq!(stored_values, HashMap::new());
         assert!(error_text.is_some());
 
         assert!(
@@ -509,7 +513,6 @@ mod tests {
     async fn pending_mode_freezes_runtime_commands_until_resume() {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (runtime_tx, runtime_control_tx, _runtime_terminate_handle) = spawn_runtime(
-            HashMap::new(),
             execute_request(
                 r#"
 await new Promise((resolve) => setTimeout(resolve, 60_000));

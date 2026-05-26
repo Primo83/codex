@@ -59,8 +59,11 @@ impl ToolExecutor<ToolInvocation> for ToolSearchHandler {
         ToolName::plain(TOOL_SEARCH_TOOL_NAME)
     }
 
-    fn spec(&self) -> ToolSpec {
-        create_tool_search_tool(&self.search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT)
+    fn spec(&self) -> Option<ToolSpec> {
+        Some(create_tool_search_tool(
+            &self.search_source_infos,
+            TOOL_SEARCH_DEFAULT_LIMIT,
+        ))
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
@@ -171,7 +174,6 @@ mod tests {
             .iter()
             .map(|tool| {
                 McpHandler::new(tool.clone())
-                    .expect("MCP tool should convert")
                     .search_info()
                     .expect("MCP handler should return search info")
             })

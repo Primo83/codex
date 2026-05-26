@@ -126,11 +126,6 @@ impl ContextManager {
         &self.items
     }
 
-    /// Returns raw items in the history and consumes the snapshot.
-    pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
-        self.items
-    }
-
     pub(crate) fn history_version(&self) -> u64 {
         self.history_version
     }

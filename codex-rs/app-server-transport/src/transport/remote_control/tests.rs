@@ -1339,7 +1339,7 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
             installation_id: TEST_INSTALLATION_ID.to_string(),
         },
         Some(state_db.clone()),
-        auth_manager.clone(),
+        auth_manager,
         transport_event_tx,
         shutdown_token.clone(),
         /*app_server_client_name_rx*/ None,
@@ -1358,11 +1358,8 @@ async fn remote_control_waits_for_account_id_before_enrolling() {
         AuthCredentialsStoreMode::File,
     )
     .expect("auth with account id should save");
-    auth_manager.reload().await;
 
-    let enroll_request = timeout(Duration::from_millis(100), accept_http_request(&listener))
-        .await
-        .expect("auth change should wake remote control before the retry delay");
+    let enroll_request = accept_http_request(&listener).await;
     assert_eq!(
         enroll_request.request_line,
         "POST /backend-api/wham/remote/control/server/enroll HTTP/1.1"

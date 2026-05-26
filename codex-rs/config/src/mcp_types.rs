@@ -13,9 +13,6 @@ use serde::de::Error as SerdeError;
 
 use crate::RequirementSource;
 
-/// Effective MCP environment id when config omits `environment_id`.
-pub const DEFAULT_MCP_SERVER_ENVIRONMENT_ID: &str = "local";
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AppToolApproval {
@@ -131,8 +128,9 @@ pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
 
-    /// Effective environment id for where Codex should start this MCP server.
-    pub environment_id: String,
+    /// Experimental environment selector for where Codex should start this MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_environment: Option<String>,
 
     /// When `false`, Codex skips initializing this MCP server.
     #[serde(default = "default_enabled")]
@@ -192,10 +190,6 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    pub fn is_local_environment(&self) -> bool {
-        self.environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID
-    }
-
     pub fn oauth_client_id(&self) -> Option<&str> {
         self.oauth
             .as_ref()
@@ -237,7 +231,7 @@ pub struct RawMcpServerConfig {
 
     // shared
     #[serde(default)]
-    pub environment_id: Option<String>,
+    pub experimental_environment: Option<String>,
     #[serde(default)]
     pub startup_timeout_sec: Option<f64>,
     #[serde(default)]
@@ -285,7 +279,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             url,
             bearer_token,
             bearer_token_env_var,
-            environment_id,
+            experimental_environment,
             startup_timeout_sec,
             startup_timeout_ms,
             tool_timeout_sec,
@@ -356,13 +350,9 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             return Err("invalid transport".to_string());
         };
 
-        let environment_id =
-            environment_id.unwrap_or_else(|| DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string());
-        validate_remote_stdio_cwd(&transport, &environment_id)?;
-
         Ok(Self {
             transport,
-            environment_id,
+            experimental_environment,
             startup_timeout_sec,
             tool_timeout_sec,
             enabled: enabled.unwrap_or_else(default_enabled),
@@ -393,30 +383,6 @@ impl<'de> Deserialize<'de> for McpServerConfig {
 
 const fn default_enabled() -> bool {
     true
-}
-
-fn validate_remote_stdio_cwd(
-    transport: &McpServerTransportConfig,
-    environment_id: &str,
-) -> Result<(), String> {
-    if environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID {
-        return Ok(());
-    }
-    let McpServerTransportConfig::Stdio { cwd, .. } = transport else {
-        return Ok(());
-    };
-    let Some(cwd) = cwd else {
-        return Err(format!(
-            "remote stdio MCP servers require an absolute cwd when environment_id is `{environment_id}`"
-        ));
-    };
-    if cwd.is_absolute() {
-        return Ok(());
-    }
-    Err(format!(
-        "remote stdio MCP servers require an absolute cwd when environment_id is `{environment_id}`, got `{}`",
-        cwd.display()
-    ))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema)]

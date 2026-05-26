@@ -166,9 +166,7 @@ async fn full_access_confirmation_popup_snapshot() {
         .into_iter()
         .find(|preset| preset.id == "full-access")
         .expect("full access preset");
-    chat.open_full_access_confirmation(
-        preset, /*return_to_permissions*/ false, /*profile_selection*/ None,
-    );
+    chat.open_full_access_confirmation(preset, /*return_to_permissions*/ false);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("full_access_confirmation_popup", popup);
@@ -183,7 +181,7 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
         .into_iter()
         .find(|preset| preset.id == "auto")
         .expect("auto preset");
-    chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+    chat.open_windows_sandbox_enable_prompt(preset);
 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
     assert!(
@@ -801,9 +799,8 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
             AppEvent::OpenFullAccessConfirmation {
                 preset,
                 return_to_permissions,
-                profile_selection,
             } => {
-                open_confirmation_event = Some((preset, return_to_permissions, profile_selection));
+                open_confirmation_event = Some((preset, return_to_permissions));
             }
             _ => {}
         }
@@ -814,9 +811,9 @@ async fn permissions_full_access_history_cell_emitted_only_after_confirmation() 
             "did not expect history cell before confirming full access"
         );
     }
-    let (preset, return_to_permissions, profile_selection) =
+    let (preset, return_to_permissions) =
         open_confirmation_event.expect("expected full access confirmation event");
-    chat.open_full_access_confirmation(preset, return_to_permissions, profile_selection);
+    chat.open_full_access_confirmation(preset, return_to_permissions);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(

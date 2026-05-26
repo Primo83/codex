@@ -224,7 +224,6 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
     let preview = engine.preview_pre_tool_use(&PreToolUseRequest {
         session_id: ThreadId::new(),
         turn_id: "turn-1".to_string(),
-        subagent: None,
         cwd: cwd.clone(),
         transcript_path: None,
         model: "gpt-test".to_string(),
@@ -241,7 +240,6 @@ with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
         .run_pre_tool_use(PreToolUseRequest {
             session_id: ThreadId::new(),
             turn_id: "turn-1".to_string(),
-            subagent: None,
             cwd,
             transcript_path: None,
             model: "gpt-test".to_string(),
@@ -313,7 +311,6 @@ async fn requirements_managed_hooks_execute_windows_command_override() {
         .run_pre_tool_use(PreToolUseRequest {
             session_id: ThreadId::new(),
             turn_id: "turn-1".to_string(),
-            subagent: None,
             cwd: cwd(),
             transcript_path: None,
             model: "gpt-test".to_string(),
@@ -699,7 +696,6 @@ fn requirements_managed_hooks_load_when_managed_dir_is_missing() {
     let preview = engine.preview_pre_tool_use(&PreToolUseRequest {
         session_id: ThreadId::new(),
         turn_id: "turn-1".to_string(),
-        subagent: None,
         cwd,
         transcript_path: None,
         model: "gpt-test".to_string(),
@@ -1105,7 +1101,6 @@ fn discovers_hooks_from_json_and_toml_in_the_same_layer() {
     let preview = engine.preview_pre_tool_use(&PreToolUseRequest {
         session_id: ThreadId::new(),
         turn_id: "turn-1".to_string(),
-        subagent: None,
         cwd,
         transcript_path: None,
         model: "gpt-test".to_string(),
@@ -1191,7 +1186,6 @@ print(json.dumps({
     let preview = engine.preview_pre_tool_use(&PreToolUseRequest {
         session_id: ThreadId::new(),
         turn_id: "turn-1".to_string(),
-        subagent: None,
         cwd: cwd(),
         transcript_path: None,
         model: "gpt-test".to_string(),
@@ -1223,7 +1217,6 @@ print(json.dumps({
         .run_pre_tool_use(PreToolUseRequest {
             session_id: ThreadId::new(),
             turn_id: "turn-1".to_string(),
-            subagent: None,
             cwd: cwd(),
             transcript_path: None,
             model: "gpt-test".to_string(),
